@@ -290,6 +290,14 @@ typedef IOReturn (*AVCDeviceMessageNotification) (class AVCDevice *pAVCDevice,
 //   PanelSubunitController.h, MusicSubunitController.h, MPEGTrickModes.h,
 //   VirtualTapeSubunit.h, VirtualMPEGTapePlayerRecorder.h, VirtualMusicSubunit.h,
 //   FWA_IORemapper.h
+//
+// MPEG2Transmitter.cpp is compiled (the managed AVCDevice API references the
+// transmitter, even though tapecap never transmits) and it borrows exactly one
+// constant from the non-vendored MPEGTrickModes.h. Hoist just that define so the
+// transmitter still compiles.
+#ifndef kMaxAutoPSIDetectProgramIndex
+#define kMaxAutoPSIDetectProgramIndex 3
+#endif
 
 namespace AVS
 {

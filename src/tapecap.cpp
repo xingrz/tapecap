@@ -400,6 +400,11 @@ static int CmdCapture(const CaptureOptions &opt)
         return 2;
     }
 
+    // Refresh capabilities so the detected format reflects the deck's *current*
+    // DV/HDV mode. This is safe before opening — it's the same call the
+    // controller makes during discovery, using the unit's AVC interface.
+    dev->discoverAVCDeviceCapabilities();
+
     if (dev->openDevice(DeviceMessageProc, nullptr) != kIOReturnSuccess)
     {
         Info("error: could not open device '%s'. Another app may be using it,", dev->deviceName);
@@ -408,9 +413,6 @@ static int CmdCapture(const CaptureOptions &opt)
         if (!st.toStdout) fclose(st.out);
         return 1;
     }
-
-    // Refresh so the format reflects the deck's current mode.
-    dev->discoverAVCDeviceCapabilities();
 
     // Decide DV vs HDV
     bool useHdv;
