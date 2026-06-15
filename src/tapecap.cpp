@@ -448,9 +448,20 @@ static int CmdCapture(const CaptureOptions &opt)
     }
     else
     {
+        // The DV receiver needs a concrete DV mode to size its frame buffers.
+        // discoverAVCDeviceCapabilities() fills dev->dvMode from the deck's
+        // signal mode; if that's unknown (0xFF), fall back to NTSC SD DV25 so
+        // the receiver doesn't reject it outright.
+        UInt8 dvMode = dev->dvMode;
+        if (dvMode == 0xFF)
+        {
+            dvMode = kDVModeSD_525_60;  // 0x00
+            Info("warning: DV mode unknown; assuming NTSC SD (DV25). Put the deck in");
+            Info("         Play/VTR mode for reliable auto-detection (PAL would differ).");
+        }
         stream = dev->CreateDVReceiverForDevicePlug(0, DvFrameProc, &st, nullptr, &st, &logger,
                                                     kCyclesPerDVReceiveSegment * 2,
-                                                    kNumDVReceiveSegments, dev->dvMode);
+                                                    kNumDVReceiveSegments, dvMode);
         if (stream && stream->pDVReceiver && opt.eotTimeoutMs > 0)
             stream->pDVReceiver->registerNoDataNotificationCallback(NoDataProc, &st, opt.eotTimeoutMs);
     }
