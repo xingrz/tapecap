@@ -122,14 +122,17 @@ fails to open the device:
 
 ## Status & limitations
 
-- This tool is built around Apple's proven AVCVideoServices code, but it relies
-  on **deprecated-but-present** IOKit FireWire isochronous APIs. They work
-  through macOS 15; there is no path on macOS 26+.
-- CI builds and smoke-tests the binary on macOS 14/15, but **cannot test against
-  real hardware** (the runners have no FireWire bus). Please report results with
-  your camera/deck. Apple Silicon uses 16 KB VM pages vs 4 KB on Intel — if you
-  hit isoch buffer issues on Apple Silicon specifically, that's the first thing
-  to suspect; please file an issue with `-v` output.
+- **Verified on real hardware.** HDV capture (full video + audio + metadata)
+  confirmed against a **Sony HDR-HC9** on both a **MacBook Pro 2018 (Intel,
+  macOS 12.6)** and an **M1 Max MacBook Pro (Apple Silicon, macOS 15)** — the
+  latter through an Apple Thunderbolt-to-FireWire adapter. CI additionally
+  builds and smoke-tests the universal binary on macOS 14/15.
+- This tool is built around Apple's proven AVCVideoServices code and relies on
+  **deprecated-but-present** IOKit FireWire isochronous APIs. They work through
+  macOS 15; there is no path on macOS 26+.
+- Stream format (DV vs HDV) is auto-detected from the device's output-plug
+  signal format; if a particular deck misreports it, force it with
+  `--format hdv` / `--format dv`. `tapecap info` shows what was detected.
 - Only the device's **output plug 0** is used (the normal tape-playback plug).
 
 ## Credits & license
