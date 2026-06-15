@@ -1,0 +1,7 @@
+build/
+dist/
+*.o
+*.dv
+*.m2t
+*.ts
+.DS_Store

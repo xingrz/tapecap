@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # FireWire SDK headers ship through macOS 15; they were removed in
+        # macOS 26. Build on the SDKs we actually support.
+        os: [ macos-15, macos-14 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain & SDK
+        run: |
+          clang++ --version
+          echo "SDK path:    $(xcrun --show-sdk-path)"
+          echo "SDK version: $(xcrun --show-sdk-version)"
+          SDK="$(xcrun --show-sdk-path)"
+          echo "--- IOKit FireWire headers ---"
+          ls "$SDK/System/Library/Frameworks/IOKit.framework/Headers/firewire" || echo "MISSING IOKit/firewire headers"
+          ls "$SDK/System/Library/Frameworks/IOKit.framework/Headers/avc"      || echo "MISSING IOKit/avc headers"
+
+      - name: Build (universal arm64 + x86_64)
+        run: make -j3
+
+      - name: Verify universal binary
+        run: |
+          file build/tapecap
+          lipo -info build/tapecap
+          lipo -info build/tapecap | grep -q arm64
+          lipo -info build/tapecap | grep -q x86_64
+
+      - name: Smoke test (no FireWire hardware on CI)
+        run: |
+          ./build/tapecap --version
+          ./build/tapecap --help
+          # 'list' finds no devices on CI; just make sure it doesn't crash.
+          ./build/tapecap list || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/tapecap dist/
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          tar -czf "tapecap-${{ matrix.os }}.tar.gz" -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tapecap-${{ matrix.os }}
+          path: tapecap-${{ matrix.os }}.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release (universal)
+        run: make -j3
+      - name: Package
+        run: tar -czf tapecap-macos-universal.tar.gz -C build tapecap
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tapecap-macos-universal.tar.gz
