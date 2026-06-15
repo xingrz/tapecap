@@ -28,6 +28,9 @@
 #include <cstring>
 #include <string>
 #include <ctime>
+#include <mutex>
+
+#include "dvmeta.h"
 
 using namespace AVS;
 
@@ -71,6 +74,29 @@ struct CaptureState
     std::atomic<unsigned long long> framesOrPackets{0};
     std::atomic<unsigned long long> dropped{0};
     bool        writeError   = false;
+
+    // Live tape metadata parsed from the stream. The HDV parser is touched only
+    // on the callback thread; the snapshots below are shared with the main
+    // thread and guarded by metaMutex.
+    tapecap::HdvTsParser     hdvParser;
+    mutable std::mutex       metaMutex;
+    tapecap::TapeMeta        latestMeta;        // most recent (for live display)
+    bool                     haveLatestMeta = false;
+    tapecap::TapeMeta        firstMeta;         // first rec date/time (for auto-name)
+    bool                     haveFirstMeta = false;
+
+    // Record a freshly decoded metadata snapshot (called from the callback).
+    void recordMeta(const tapecap::TapeMeta &m)
+    {
+        std::lock_guard<std::mutex> lk(metaMutex);
+        latestMeta = m;
+        haveLatestMeta = true;
+        if (!haveFirstMeta && m.haveDate)
+        {
+            firstMeta = m;
+            haveFirstMeta = true;
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -111,8 +137,13 @@ static IOReturn MpegDataProc(UInt32 tsPacketCount, UInt32 **ppBuf, void *refcon)
             return kIOReturnError;
         }
         st->bytesWritten.fetch_add(kMPEG2TSPacketSize);
+        st->hdvParser.Feed(reinterpret_cast<const uint8_t *>(ppBuf[i]));
     }
     st->framesOrPackets.fetch_add(tsPacketCount);
+
+    tapecap::TapeMeta m;
+    if (st->hdvParser.Latest(&m))
+        st->recordMeta(m);
     return kIOReturnSuccess;
 }
 
@@ -142,6 +173,10 @@ static IOReturn DvFrameProc(DVFrameReceiveMessage msg, DVReceiveFrame *pFrame, v
         st->framesOrPackets.fetch_add(1);
         if (msg == kDVFrameCorrupted)
             st->dropped.fetch_add(1);
+
+        tapecap::TapeMeta m;
+        if (tapecap::DvParseFrame(pFrame->pFrameData, pFrame->frameLen, &m))
+            st->recordMeta(m);
     }
     return kIOReturnSuccess;
 }
@@ -389,11 +424,89 @@ static int CmdInfo(UInt64 guid)
     return 0;
 }
 
+// Human-readable byte size.
+static std::string HumanSize(unsigned long long bytes)
+{
+    char b[32];
+    double mb = bytes / 1e6;
+    if (mb >= 1000.0) snprintf(b, sizeof(b), "%.2f GB", mb / 1000.0);
+    else              snprintf(b, sizeof(b), "%.1f MB", mb);
+    return b;
+}
+
+// One-line live status on stderr (in-place via '\r'): tape timecode, recording
+// date/time, bytes captured and elapsed time. Fields only grow once decoded, so
+// the trailing pad is enough to avoid leftover characters.
+static void PrintLiveStatus(CaptureState &st, time_t startTime)
+{
+    tapecap::TapeMeta m;
+    bool haveMeta = false;
+    {
+        std::lock_guard<std::mutex> lk(st.metaMutex);
+        haveMeta = st.haveLatestMeta;
+        if (haveMeta) m = st.latestMeta;
+    }
+    char tcbuf[16]  = "--:--:--:--";
+    char recbuf[24] = "------------------";
+    if (haveMeta && m.haveTc)
+        snprintf(tcbuf, sizeof(tcbuf), "%02d:%02d:%02d:%02d", m.tcH, m.tcM, m.tcS, m.tcF);
+    if (haveMeta && m.haveDate)
+        snprintf(recbuf, sizeof(recbuf), "%04d-%02d-%02d %02d:%02d:%02d",
+                 m.year, m.month, m.day, m.hour, m.minute, m.second);
+
+    long el = (long)(time(nullptr) - startTime);
+    std::string sz = HumanSize(st.bytesWritten.load());
+    fprintf(stderr, "\r  tc %s   rec %s   %s   (%ld:%02ld)        ",
+            tcbuf, recbuf, sz.c_str(), el / 60, el % 60);
+    fflush(stderr);
+}
+
+// Build an auto filename from the recording date/time (falls back to wall clock).
+static std::string MakeAutoName(CaptureState &st, const char *ext)
+{
+    tapecap::TapeMeta m;
+    bool haveFirst = false;
+    {
+        std::lock_guard<std::mutex> lk(st.metaMutex);
+        haveFirst = st.haveFirstMeta;
+        if (haveFirst) m = st.firstMeta;
+    }
+    char name[64];
+    if (haveFirst)
+        snprintf(name, sizeof(name), "%04d%02d%02d-%02d%02d%02d.%s",
+                 m.year, m.month, m.day, m.hour, m.minute, m.second, ext);
+    else
+    {
+        time_t now = time(nullptr);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        snprintf(name, sizeof(name), "tapecap-%04d%02d%02d-%02d%02d%02d.%s",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ext);
+    }
+    return name;
+}
+
+// Return `path` if free, else insert -1, -2, … before the extension.
+static std::string UniquePath(const std::string &path)
+{
+    if (access(path.c_str(), F_OK) != 0) return path;
+    std::string base = path, ext;
+    size_t dot = path.find_last_of('.');
+    if (dot != std::string::npos) { base = path.substr(0, dot); ext = path.substr(dot); }
+    for (int n = 1; n < 1000; n++)
+    {
+        std::string cand = base + "-" + std::to_string(n) + ext;
+        if (access(cand.c_str(), F_OK) != 0) return cand;
+    }
+    return path;
+}
+
 struct CaptureOptions
 {
     UInt64       guid        = 0;
     std::string  format      = "auto";   // auto | dv | hdv
-    std::string  outPath;
+    std::string  outPath;                  // empty = auto-name; "-" = stdout
     int          durationSec = 0;          // 0 = until stop condition
     int          eotTimeoutMs = 5000;      // 0 = never auto-stop on silence
     bool         control     = true;       // send PLAY/STOP
@@ -405,11 +518,25 @@ static int CmdCapture(const CaptureOptions &opt)
     CaptureState st;
     st.verbose = opt.verbose;
 
-    // Open output
-    if (opt.outPath == "-")
+    // Open output. With no path we capture into a hidden temp file and rename it
+    // to the recording's date/time (parsed from the stream) when we're done.
+    const bool toStdout = (opt.outPath == "-");
+    const bool autoName = opt.outPath.empty();
+    std::string tmpPath;
+    if (toStdout)
     {
         st.out = stdout;
         st.toStdout = true;
+    }
+    else if (autoName)
+    {
+        tmpPath = std::string(".tapecap-") + std::to_string((long)getpid()) + ".part";
+        st.out = fopen(tmpPath.c_str(), "wb");
+        if (!st.out)
+        {
+            Info("error: cannot open temp output file '%s'", tmpPath.c_str());
+            return 1;
+        }
     }
     else
     {
@@ -421,12 +548,18 @@ static int CmdCapture(const CaptureOptions &opt)
         }
     }
 
+    // Close (and, for auto-name, delete) a half-open output on an error exit.
+    auto cleanupOut = [&]() {
+        if (st.out && st.out != stdout) fclose(st.out);
+        if (autoName && !tmpPath.empty()) remove(tmpPath.c_str());
+    };
+
     StringLogger logger(FrameworkLog);
     AVCDeviceController *controller = nullptr;
     if (CreateAVCDeviceController(&controller, nullptr, nullptr) != kIOReturnSuccess || !controller)
     {
         Info("error: could not create AVC device controller (is the FireWire driver present?)");
-        if (!st.toStdout) fclose(st.out);
+        cleanupOut();
         return 1;
     }
     WaitForDevices(controller, 3000);
@@ -436,7 +569,7 @@ static int CmdCapture(const CaptureOptions &opt)
     {
         Info("error: no DV/HDV device found. Try 'tapecap list'.");
         DestroyAVCDeviceController(controller);
-        if (!st.toStdout) fclose(st.out);
+        cleanupOut();
         return 2;
     }
 
@@ -450,7 +583,7 @@ static int CmdCapture(const CaptureOptions &opt)
         Info("error: could not open device '%s'. Another app may be using it,", dev->deviceName);
         Info("       or capture permission was denied (see README: permissions).");
         DestroyAVCDeviceController(controller);
-        if (!st.toStdout) fclose(st.out);
+        cleanupOut();
         return 1;
     }
 
@@ -485,14 +618,16 @@ static int CmdCapture(const CaptureOptions &opt)
             if (playStarted) SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
             dev->closeDevice();
             DestroyAVCDeviceController(controller);
-            if (!st.toStdout) fclose(st.out);
+            cleanupOut();
             return 2;
         }
     }
 
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
     Info("Format:  %s", useHdv ? "HDV (raw MPEG-2 TS)" : "DV (raw DIF)");
-    Info("Output:  %s", st.toStdout ? "<stdout>" : opt.outPath.c_str());
+    Info("Output:  %s", toStdout ? "<stdout>"
+                        : autoName ? "(auto-named from recording date/time)"
+                        : opt.outPath.c_str());
 
     // Create the managed receive stream on output plug 0. The AVCDevice handles
     // isoch channel + bandwidth allocation and the point-to-point connection.
@@ -527,7 +662,7 @@ static int CmdCapture(const CaptureOptions &opt)
         Info("error: could not create receive stream for output plug 0.");
         dev->closeDevice();
         DestroyAVCDeviceController(controller);
-        if (!st.toStdout) fclose(st.out);
+        cleanupOut();
         return 1;
     }
 
@@ -550,14 +685,15 @@ static int CmdCapture(const CaptureOptions &opt)
         dev->DestroyAVCDeviceStream(stream);
         dev->closeDevice();
         DestroyAVCDeviceController(controller);
-        if (!st.toStdout) fclose(st.out);
+        cleanupOut();
         return 1;
     }
 
     Info("Capturing… press Ctrl-C to stop.%s",
          opt.eotTimeoutMs > 0 ? " (auto-stops at end of tape)" : "");
 
-    // Main wait loop.
+    // Main wait loop. Show a live status line in place when stderr is a TTY.
+    const bool showProgress = isatty(fileno(stderr));
     time_t start = time(nullptr);
     const char *reason = "stopped";
     while (true)
@@ -580,11 +716,10 @@ static int CmdCapture(const CaptureOptions &opt)
             break;
         }
 
-        if (!st.toStdout && opt.verbose)
-            fprintf(stderr, "\r%llu frames/packets, %llu bytes   ",
-                    st.framesOrPackets.load(), st.bytesWritten.load());
+        if (showProgress)
+            PrintLiveStatus(st, start);
     }
-    if (!st.toStdout && opt.verbose) fputc('\n', stderr);
+    if (showProgress) fputc('\n', stderr);
 
     // Teardown
     dev->StopAVCDeviceStream(stream);
@@ -600,10 +735,29 @@ static int CmdCapture(const CaptureOptions &opt)
         fclose(st.out);
     }
 
+    // Auto-name: rename the temp file to the recording's date/time, or discard
+    // it if nothing usable was captured.
+    std::string savedPath;
+    if (autoName && !st.toStdout)
+    {
+        if (!st.writeError && st.bytesWritten.load() > 0)
+        {
+            savedPath = UniquePath(MakeAutoName(st, useHdv ? "m2t" : "dv"));
+            if (rename(tmpPath.c_str(), savedPath.c_str()) != 0)
+                savedPath = tmpPath;  // rename failed; keep the temp file as-is
+        }
+        else
+        {
+            remove(tmpPath.c_str());
+        }
+    }
+
     Info("Done (%s): %llu frames/packets, %llu bytes written.",
          reason,
          st.framesOrPackets.load(),
          st.bytesWritten.load());
+    if (!savedPath.empty())
+        Info("Saved:   %s", savedPath.c_str());
     if (st.dropped.load())
         Info("Note: %llu dropped/corrupted frame(s) — check the FireWire cable/connection.",
              st.dropped.load());
@@ -628,7 +782,7 @@ static void Usage(FILE *f)
 "USAGE:\n"
 "  tapecap list\n"
 "  tapecap info    [--guid <hex>]\n"
-"  tapecap capture [options] <output>\n"
+"  tapecap capture [options] [output]\n"
 "  tapecap --help | --version\n"
 "\n"
 "CAPTURE OPTIONS:\n"
@@ -637,15 +791,19 @@ static void Usage(FILE *f)
 "  --duration <sec>    Stop after N seconds        (default: until Ctrl-C / EOT)\n"
 "  --eot-timeout <ms>  Stop after this much silence; 0 disables   (default: 5000)\n"
 "  --no-control        Do NOT send AV/C PLAY/STOP (press play on the deck yourself)\n"
-"  -v, --verbose       Progress + framework log on stderr\n"
-"  <output>            File to write, or '-' for stdout\n"
+"  -v, --verbose       Also print the framework's internal log on stderr\n"
+"  [output]            File to write. Omit to auto-name from the recording's\n"
+"                      date/time; use '-' to write to stdout.\n"
+"\n"
+"While capturing, a live status line (tape timecode, recording date/time, size)\n"
+"is shown in place on stderr.\n"
 "\n"
 "OUTPUT IS RAW: DV writes the DIF stream (.dv); HDV writes the MPEG-2 Transport\n"
 "Stream as-is (.m2t / .ts) — video + audio + metadata, nothing demuxed.\n"
 "\n"
 "EXAMPLES:\n"
 "  tapecap list\n"
-"  tapecap capture tape01.m2t                 # auto-detect, roll tape, stop at EOT\n"
+"  tapecap capture                            # auto-detect, auto-name e.g. 20101029-140926.m2t\n"
 "  tapecap capture --format dv reel.dv\n"
 "  tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv\n",
     kTapecapVersion);
@@ -725,11 +883,7 @@ int main(int argc, char **argv)
                 opt.outPath = a;
             }
         }
-        if (opt.outPath.empty())
-        {
-            Info("error: capture requires an <output> path (use '-' for stdout)");
-            return 2;
-        }
+        // An empty outPath is valid: it means "auto-name from the recording".
         if (opt.format != "auto" && opt.format != "dv" && opt.format != "hdv")
         {
             Info("error: --format must be auto, dv or hdv");
