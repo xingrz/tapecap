@@ -71,7 +71,7 @@ make install    # optional, installs to /usr/local/bin
 ```
 tapecap list                       # list connected FireWire AV/C devices
 tapecap info    [--guid <hex>]     # show device capabilities, mode, timecode
-tapecap capture [options] <output> # capture raw stream to a file (or '-' = stdout)
+tapecap capture [options] [output] # capture raw stream (omit output to auto-name)
 ```
 
 ### Capture options
@@ -83,15 +83,22 @@ tapecap capture [options] <output> # capture raw stream to a file (or '-' = stdo
 | `--duration <sec>` | Stop after N seconds (default: until Ctrl-C / end of tape) |
 | `--eot-timeout <ms>` | Auto-stop after this much silence; `0` disables (default: 5000) |
 | `--no-control` | Don't send AV/C PLAY/STOP — you press play on the deck yourself |
-| `-v`, `--verbose` | Progress on stderr + the framework's internal log |
+| `-v`, `--verbose` | Also print the framework's internal log on stderr |
+| `[output]` | File to write. **Omit** to auto-name from the recording's date/time; use `-` for stdout. |
+
+While capturing, a **live status line** (tape SMPTE timecode, recording
+date/time and size) updates in place on stderr — no flag needed. The timecode
+and recording date/time are read straight from the stream (DV VAUX/subcode packs
+and the Sony HDV MPEG-TS AUX stream).
 
 ### Examples
 
 ```sh
-# Auto-detect DV vs HDV, roll the tape, and stop when the tape runs out:
-tapecap capture reel01.m2t
+# Auto-detect DV vs HDV, roll the tape, stop at end of tape, and save as
+# e.g. 20101029-140926.m2t (from the recording's own date/time):
+tapecap capture
 
-# Force DV, capture a fixed 60 seconds:
+# Force DV, capture a fixed 60 seconds to a named file:
 tapecap capture --format dv --duration 60 clip.dv
 
 # Don't drive the transport; pipe a live HDV stream straight into ffmpeg:
@@ -142,5 +149,7 @@ fails to open the device:
   [`third_party/AVCVideoServices/`](third_party/AVCVideoServices/) (Apple
   sample-code license; provenance and details in its
   [`NOTICE.md`](third_party/AVCVideoServices/NOTICE.md)).
+- The DV/HDV recording-date and timecode parser (`src/dvmeta.*`) is ported from
+  [xingrz/iina-dv-timecode](https://github.com/xingrz/iina-dv-timecode).
 - Thanks to the IEEE 1394 / DV archival community — *dvgrab*, *libiec61883*, and
   MediaArea/MIPoPS *dvrescue* — for keeping this knowledge alive.
