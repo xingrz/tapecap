@@ -197,30 +197,26 @@ static UInt64 ParseGuid(const char *s)
     return (UInt64)strtoull(s, nullptr, 16);
 }
 
-// Pick a capture device: by explicit GUID, else the first attached device that
-// has a tape subunit and a recognised DV or HDV/MPEG output format.
+// Pick a capture device: by explicit GUID, else prefer a tape/DV/HDV device,
+// otherwise just the first device the controller enumerated (the same set that
+// 'list' shows). We deliberately don't gate on isAttached or the DV/HDV flags
+// here: capability discovery is asynchronous and can lag behind enumeration, and
+// the caller re-runs discovery and opens the device anyway.
 static AVCDevice *SelectDevice(AVCDeviceController *controller, UInt64 wantGuid)
 {
     CFIndex count = CFArrayGetCount(controller->avcDeviceArray);
     if (wantGuid != 0)
-    {
-        AVCDevice *d = controller->findDeviceByGuid(wantGuid);
-        return d;
-    }
+        return controller->findDeviceByGuid(wantGuid);
+
+    AVCDevice *first = nullptr;
     for (CFIndex i = 0; i < count; i++)
     {
         AVCDevice *d = (AVCDevice *)CFArrayGetValueAtIndex(controller->avcDeviceArray, i);
-        if (d->isAttached && (d->isDVDevice || d->isMPEGDevice))
+        if (!first) first = d;
+        if (d->hasTapeSubunit || d->isDVDevice || d->isMPEGDevice)
             return d;
     }
-    // fall back to first attached device, if any
-    for (CFIndex i = 0; i < count; i++)
-    {
-        AVCDevice *d = (AVCDevice *)CFArrayGetValueAtIndex(controller->avcDeviceArray, i);
-        if (d->isAttached)
-            return d;
-    }
-    return nullptr;
+    return first;  // nothing flagged yet — fall back to the first enumerated device
 }
 
 static const char *FormatName(AVCDevice *d)
@@ -258,6 +254,42 @@ static bool ReadTimecode(AVCDevice *dev, char *buf, size_t buflen)
         return true;
     }
     return false;
+}
+
+enum DetectedFormat { kFmtUnknown, kFmtDV, kFmtHDV };
+
+// Read the *actual* stream format from the device's output plug (oPCR). This
+// reflects what the deck is really putting on the bus, which is more reliable
+// than the tape subunit's signal-mode status: some HDV camcorders (e.g. the Sony
+// HDR-HC9) report DV there even while streaming HDV. Mirrors AVCVideoServices'
+// outputPlugSignalFormat(). Returns kFmtHDV, kFmtDV, or kFmtUnknown.
+// Requires the device to be open.
+static DetectedFormat ReadOutputPlugFormat(AVCDevice *dev, UInt8 plug)
+{
+    UInt8 cmd[8]  = { kAVCStatusInquiryCommand, kAVCUnitAddress,
+                      kAVCOutputPlugSignalFormatOpcode, plug, 0xFF, 0xFF, 0xFF, 0xFF };
+    UInt8 resp[8] = { 0 };
+    UInt32 rlen   = sizeof(resp);
+    if (dev->AVCCommand(cmd, sizeof(cmd), resp, &rlen) != kIOReturnSuccess)
+        return kFmtUnknown;
+    if (resp[0] != kAVCImplementedStatus || rlen < 8)
+        return kFmtUnknown;
+    UInt32 fmt = ((UInt32)resp[4] << 24) | ((UInt32)resp[5] << 16) |
+                 ((UInt32)resp[6] << 8)  |  (UInt32)resp[7];
+    if ((fmt & 0xFF000000) == kAVCPlugSignalFormatMPEGTS) return kFmtHDV;
+    if ((fmt & 0xFF000000) == kAVCPlugSignalFormatNTSCDV) return kFmtDV;
+    return kFmtUnknown;
+}
+
+// Decide DV vs HDV. Trust the live output-plug format first; fall back to the
+// capability flags derived from the (less reliable) tape signal-mode query.
+static DetectedFormat DetectFormat(AVCDevice *dev)
+{
+    DetectedFormat f = ReadOutputPlugFormat(dev, 0);
+    if (f != kFmtUnknown) return f;
+    if (dev->isMPEGDevice) return kFmtHDV;
+    if (dev->isDVDevice)   return kFmtDV;
+    return kFmtUnknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +371,14 @@ static int CmdInfo(UInt64 guid)
 
     if (dev->openDevice(DeviceMessageProc, nullptr) == kIOReturnSuccess)
     {
+        // The output-plug (oPCR) format reflects what's actually on the bus and
+        // is the value capture's auto-detect trusts. It can disagree with the
+        // signal-mode "Format" above (e.g. Sony HDR-HC9 reports DV there while
+        // streaming HDV) — so show it explicitly.
+        DetectedFormat op = ReadOutputPlugFormat(dev, 0);
+        printf("Output plug 0: %s\n",
+               op == kFmtHDV ? "HDV / MPEG-TS" : op == kFmtDV ? "DV" : "not reported (idle?)");
+
         char tc[32];
         if (ReadTimecode(dev, tc, sizeof(tc)))
             printf("Timecode:      %s\n", tc);
@@ -416,16 +456,33 @@ static int CmdCapture(const CaptureOptions &opt)
 
     // Decide DV vs HDV
     bool useHdv;
+    bool playStarted = false;
     if (opt.format == "dv")       useHdv = false;
     else if (opt.format == "hdv") useHdv = true;
     else                          // auto
     {
-        if (dev->isMPEGDevice)      useHdv = true;
-        else if (dev->isDVDevice)   useHdv = false;
+        DetectedFormat det = DetectFormat(dev);
+
+        // Some decks only expose a meaningful output-plug format once the
+        // transport is actually rolling. If we can't tell yet, start playback
+        // and look again before giving up.
+        if (det == kFmtUnknown && opt.control && dev->hasTapeSubunit)
+        {
+            Info("Format not reported yet — starting playback to detect…");
+            SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
+            playStarted = true;
+            usleep(1500 * 1000);
+            det = DetectFormat(dev);
+        }
+
+        if (det == kFmtHDV)      useHdv = true;
+        else if (det == kFmtDV)  useHdv = false;
         else
         {
-            Info("error: could not auto-detect stream format. Put the deck in Play/VTR mode,");
-            Info("       or force it with --format dv|hdv.");
+            Info("error: could not auto-detect the stream format.");
+            Info("       Make sure the deck is in Play/VTR mode, or force it with");
+            Info("       --format hdv   (or --format dv).");
+            if (playStarted) SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
             dev->closeDevice();
             DestroyAVCDeviceController(controller);
             if (!st.toStdout) fclose(st.out);
@@ -478,8 +535,8 @@ static int CmdCapture(const CaptureOptions &opt)
     signal(SIGINT, HandleSignal);
     signal(SIGTERM, HandleSignal);
 
-    // Roll the tape.
-    if (opt.control && dev->hasTapeSubunit)
+    // Roll the tape (unless detection already started it).
+    if (opt.control && dev->hasTapeSubunit && !playStarted)
     {
         IOReturn r = SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
         if (r != kIOReturnSuccess)
