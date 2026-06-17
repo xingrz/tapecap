@@ -39,9 +39,13 @@ See [`docs/BACKGROUND.md`](docs/BACKGROUND.md) for the gory details.
 - **Automatic transport control** — sends AV/C **PLAY** on start and **STOP** at
   the end; also stops on `--duration`, Ctrl-C, or end of tape (`--no-control`
   lets you drive the deck yourself).
-- **Live status while capturing** — tape SMPTE timecode, recording date/time and
-  size, parsed straight from the stream (DV VAUX/subcode packs and the Sony HDV
-  MPEG-TS AUX stream).
+- **Live status while capturing** — tape SMPTE timecode, recording date/time,
+  size and a real coded-frame count, parsed straight from the stream (DV
+  VAUX/subcode packs and the Sony HDV MPEG-TS AUX stream), plus a running count
+  of transport continuity errors (the tape/transport damage signal).
+- **Stream diagnostics (HDV)** — confirms the elementary streams present (video,
+  audio, timecode AUX — the audio and AUX are exactly what AVFoundation drops)
+  and reports the video geometry, frame rate and bit rate from the stream.
 - **Auto-naming** — with no output path, files are named from the recording's
   own date/time (e.g. `20101029-140926.m2t`); pass `-` to stream to stdout.
 - **Universal binary** — one arm64 + x86_64 build for macOS 11–15.
@@ -111,9 +115,15 @@ tapecap capture [options] [output] # capture raw stream (omit output to auto-nam
 | `[output]` | File to write. **Omit** to auto-name from the recording's date/time; use `-` for stdout. |
 
 While capturing, a **live status line** (tape SMPTE timecode, recording
-date/time and size) updates in place on stderr — no flag needed. The timecode
-and recording date/time are read straight from the stream (DV VAUX/subcode packs
-and the Sony HDV MPEG-TS AUX stream).
+date/time, size, coded-frame count and a continuity-error count) updates in
+place on stderr — no flag needed. The timecode and recording date/time are read
+straight from the stream (DV VAUX/subcode packs and the Sony HDV MPEG-TS AUX
+stream). For HDV, the tool also prints once which elementary streams are present
+(video, audio, timecode AUX) and the video geometry / frame rate / bit rate.
+
+The continuity-error count is detect-and-report only — it never interrupts the
+capture, so a damaged tape still yields the most complete raw dump possible; the
+count just tells you whether the transport was clean.
 
 ### Examples
 

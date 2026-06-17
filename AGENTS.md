@@ -113,6 +113,25 @@ authoritative pack-layout docs). It parses:
   Only Sony's AUX path is implemented. If a non-Sony HDV deck shows no live
   timecode, that's why — capture is unaffected.
 
+Beyond date/timecode, the HDV TS parser (`HdvTsParser`) accumulates best-effort
+live diagnostics in an `HdvStats` snapshot (`Stats()`), all read-only / never
+affecting the bytes written:
+
+- **Continuity errors** — per-PID `continuity_counter` breaks not flagged by the
+  adaptation field's `discontinuity_indicator`; the transport damage signal.
+  **Detect-and-report only — must never interrupt capture** (same rule as DV's
+  dropped-frame count). Surfaced as the live `err` field + a summary note.
+- **Stream presence** — which elementary streams the PMT lists (video, audio +
+  its `stream_type`, the Sony timecode AUX). Printed once as the `Stream:` line —
+  the audio and AUX are exactly what AVFoundation drops, so this is the proof
+  they made it into the raw `.m2t`.
+- **Video structure** — coded-frame count + GOP sizes (counting `picture_header`
+  / GOP start codes through a rolling 4-byte window over the video ES, robust
+  across packet boundaries) and resolution / frame rate / bit rate from the first
+  `sequence_header`. Note: the GOP header's own 25-bit timecode is `00:00:00:00`
+  on Sony HDV (unused) — don't rely on it; the tape timecode comes from the AUX
+  stream above.
+
 ## How to build / test / release
 
 ### Building
