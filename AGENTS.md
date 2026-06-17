@@ -37,7 +37,6 @@ layer Premiere uses. See `docs/BACKGROUND.md` for the full write-up.
 | `Makefile` | Universal (arm64+x86_64) build. | Yes. |
 | `.github/workflows/build.yml` | CI build + smoke test; release job. | Yes. |
 | `docs/BACKGROUND.md` | Deep technical explanation. | Keep current. |
-| `RELEASE_NOTES.md` | Used as the GitHub Release body (`body_path`). | Update before each release. |
 | `third_party/.../NOTICE.md` | Provenance + license of the vendored code. | Keep accurate. |
 
 ### About the vendored AVCVideoServices
@@ -140,12 +139,45 @@ file just works.
 
 ### Releasing
 
-- A `v*` **tag push** triggers the `release` job (builds + publishes a GitHub
-  Release with `tapecap-macos-universal.tar.gz`).
-- OR trigger it manually: Actions → "build" → Run workflow → set the
-  `release_tag` input (e.g. `v0.1.0`). This path also *creates* the tag — it was
-  added precisely because some environments can't push tags (see below).
-- Release notes come from `RELEASE_NOTES.md` (`body_path`). Edit that file first.
+**Releases happen only via a `v*` tag push.** There is no manual workflow
+trigger. Pushing a `v*` tag runs the `release` job, which builds the universal
+binary and publishes a GitHub Release with `tapecap-macos-universal.tar.gz` and
+an **empty body**. The body is written in by hand afterward (see the style rules
+below).
+
+When the user asks to cut a release, do this end to end:
+
+1. **Pick the version** and bump `kTapecapVersion` in `src/tapecap.cpp` to match
+   (drop the `v`, so tag `v0.2.0` ⇒ `"0.2.0"`). Commit that on `master`.
+2. **Tag and push:** `git tag vX.Y.Z && git push origin master --tags` (or push
+   the commit and the tag). The tag push is what triggers the release.
+3. **Monitor CI** until the `build` and `release` jobs finish
+   (`gh run watch`, or `gh run list` then `gh run view`). Don't proceed until the
+   release job is green and the release exists.
+4. **Write the release body** in the brief changelog style below, then publish it
+   with `gh release edit vX.Y.Z --notes-file <file>` (or `--notes`). Show the user
+   the proposed body first if there's any doubt.
+
+#### Release-body style
+
+The README is the product description; the **release body is a short changelog**,
+not a second README. Keep it tight:
+
+- One short lead line stating what the release is (e.g. "First public release."
+  or a one-line summary of the theme of the changes).
+- A small bullet list of the actual **change points** — what's new/fixed/changed
+  in this version, phrased for someone who already knows what tapecap is. Each
+  bullet one line, concrete, no marketing.
+- Do **not** restate requirements, install steps, usage, background, or credits —
+  those live in the README. End with a pointer: "See the README for
+  requirements, install and usage."
+- The downloadable artifact (`tapecap-macos-universal.tar.gz`) is attached by CI;
+  don't paste install commands into the body.
+- **Do not hard-wrap.** GitHub renders a single newline inside a paragraph or
+  bullet as a real line break, so wrapped prose looks broken on the release page.
+  Put each paragraph and each bullet on **one long line**; only use newlines to
+  separate paragraphs/bullets. (This file may wrap them for readability — the
+  release body must not.)
 
 ## Environment gotchas (if you're a remote/sandboxed agent, not on the user's Mac)
 
@@ -157,8 +189,10 @@ hardware), the prior sessions hit these:
   compiler — push and read the run. The vendored code's SDK headers (`IOKit/firewire`,
   `IOKit/avc`) DO exist in the macos-15 runner's SDK.
 - **The git proxy only accepts pushes to the active/default branch (`master`).**
-  Pushing tags or other branches returns HTTP 403/503. Create branches/tags via
-  the GitHub MCP tools, and cut releases via the `workflow_dispatch` path above.
+  Pushing tags or other branches returns HTTP 403/503. So create the release tag
+  via the GitHub MCP tools (or the GitHub API) instead of `git push --tags` — a
+  tag created that way still fires the `release` job, which is the only way to
+  release now that the manual trigger is gone.
 - **`api.github.com` is blocked** from the sandbox (403). Use the GitHub MCP
   tools for GitHub state; use the local git proxy (`127.0.0.1`) for git.
 - The repo is **public**; develop directly on `master`, no PR required (per the

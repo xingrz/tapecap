@@ -5,12 +5,6 @@ on:
     branches: [ "**" ]
     tags: [ "v*" ]
   pull_request:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Create a release with this tag (e.g. v0.1.0); leave empty for just a build"
-        required: false
-        default: ""
 
 jobs:
   build:
@@ -61,10 +55,10 @@ jobs:
           path: tapecap-macos.tar.gz
 
   release:
-    # Runs on a v* tag push, or on a manual dispatch with a release_tag input
-    # (the latter also creates the tag — handy since not every environment can
-    # push tags directly).
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+    # Runs only on a v* tag push: builds the universal binary and publishes a
+    # GitHub Release with it. The body is left empty on purpose — it gets
+    # written in afterward (see AGENTS.md → Releasing).
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: macos-15
     permissions:
@@ -78,6 +72,4 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          body_path: RELEASE_NOTES.md
           files: tapecap-macos-universal.tar.gz

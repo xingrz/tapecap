@@ -30,6 +30,22 @@ modern universal binary.
 
 See [`docs/BACKGROUND.md`](docs/BACKGROUND.md) for the gory details.
 
+## Features
+
+- **`list` / `info` / `capture`** — enumerate FireWire AV/C devices, inspect a
+  deck's capabilities and current mode/timecode, and capture the raw stream.
+- **DV / HDV auto-detect** — picks the format from the deck's output-plug signal
+  format; override with `--format dv|hdv`.
+- **Automatic transport control** — sends AV/C **PLAY** on start and **STOP** at
+  the end; also stops on `--duration`, Ctrl-C, or end of tape (`--no-control`
+  lets you drive the deck yourself).
+- **Live status while capturing** — tape SMPTE timecode, recording date/time and
+  size, parsed straight from the stream (DV VAUX/subcode packs and the Sony HDV
+  MPEG-TS AUX stream).
+- **Auto-naming** — with no output path, files are named from the recording's
+  own date/time (e.g. `20101029-140926.m2t`); pass `-` to stream to stdout.
+- **Universal binary** — one arm64 + x86_64 build for macOS 11–15.
+
 ## Requirements
 
 - **macOS 11 – 15.** macOS 15 *Sequoia* is the **last** release that ships the
