@@ -57,6 +57,16 @@ struct HdvStats
     unsigned long long pictures = 0;
     unsigned long long gops     = 0;
     int                lastGopPictures = 0;
+
+    // Decoded once from the first sequence_header (00 00 01 B3): frame geometry,
+    // frame rate, and bit rate. frameRate is 0 for an unrecognised code; bitRate
+    // is 0 when the stream signals variable/unknown.
+    bool   haveSeq       = false;
+    int    width         = 0;
+    int    height        = 0;
+    int    frameRateCode = 0;     // raw 4-bit MPEG-2 frame_rate_code
+    double frameRate     = 0.0;   // frames per second
+    int    bitRate       = 0;     // bits per second
 };
 
 // Parse one raw DV frame (DIF). Fills whatever it finds into *out and returns
@@ -84,6 +94,9 @@ private:
     std::map<int, int> lastCc_;   // PID -> last continuity_counter seen
     uint32_t vidShift_ = 0xffffffff;  // rolling last 4 bytes of the video ES
     int      gopPics_  = 0;           // picture_headers in the GOP in progress
+    int      seqNeed_  = 0;           // sequence_header bytes still to collect
+    int      seqGot_   = 0;
+    uint8_t  seqBuf_[7] = {0};        // bytes following a 00 00 01 B3 start code
 };
 
 } // namespace tapecap

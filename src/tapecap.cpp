@@ -486,6 +486,25 @@ static bool AnnounceHdvStreams(const CaptureState &st)
     return true;
 }
 
+// HDV only: once the first sequence_header is decoded, print the video geometry,
+// frame rate and bit rate. Returns true once it has printed.
+static bool AnnounceHdvVideo(const CaptureState &st)
+{
+    tapecap::HdvStats s;
+    if (!st.getHdvStats(&s) || !s.haveSeq) return false;
+
+    char line[96];
+    int n = snprintf(line, sizeof(line), "Video:   %dx%d", s.width, s.height);
+    if (s.frameRate > 0)
+        n += snprintf(line + n, sizeof(line) - n, "  %.2f fps", s.frameRate);
+    if (s.bitRate > 0)
+        snprintf(line + n, sizeof(line) - n, "  ~%.1f Mbit/s", s.bitRate / 1e6);
+
+    ClearStatusLine();
+    Info("%s", line);
+    return true;
+}
+
 // One-line live status on stderr (in-place via '\r'): tape timecode, recording
 // date/time, bytes captured and elapsed time. Fields only grow once decoded, so
 // the trailing pad is enough to avoid leftover characters.
@@ -760,6 +779,7 @@ static int CmdCapture(const CaptureOptions &opt)
     // Main wait loop. Show a live status line in place when stderr is a TTY.
     const bool showProgress = isatty(fileno(stderr));
     bool announcedStreams = false;
+    bool announcedVideo   = false;
     time_t start = time(nullptr);
     const char *reason = "stopped";
     while (true)
@@ -784,6 +804,8 @@ static int CmdCapture(const CaptureOptions &opt)
 
         if (st.isHdv && !announcedStreams)
             announcedStreams = AnnounceHdvStreams(st);
+        if (st.isHdv && !announcedVideo)
+            announcedVideo = AnnounceHdvVideo(st);
         if (showProgress)
             PrintLiveStatus(st, start);
     }
@@ -839,6 +861,14 @@ static int CmdCapture(const CaptureOptions &opt)
                                  + " frames in " + std::to_string(s.gops) + " GOP(s)";
                 if (s.lastGopPictures)
                     line += " (last GOP " + std::to_string(s.lastGopPictures) + " frames)";
+                if (s.haveSeq && s.frameRate > 0)
+                {
+                    long secs = (long)(s.pictures / s.frameRate);
+                    char extra[48];
+                    snprintf(extra, sizeof(extra), ", ~%ld:%02ld at %.2f fps",
+                             secs / 60, secs % 60, s.frameRate);
+                    line += extra;
+                }
                 Info("%s", line.c_str());
             }
             if (s.ccErrors)

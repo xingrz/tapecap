@@ -177,6 +177,28 @@ static bool parsePmt(const uint8_t *p, int payloadStart,
     return true;
 }
 
+// Decode the 7 bytes that follow a sequence_header start code (00 00 01 B3):
+// horizontal/vertical size (12 bits each), frame_rate_code, and bit_rate_value.
+static void parseSeqHeader(const uint8_t *b, HdvStats *s)
+{
+    int w = (b[0] << 4) | (b[1] >> 4);
+    int h = ((b[1] & 0x0f) << 8) | b[2];
+    if (w < 16 || w > 4096 || h < 16 || h > 4096) return;   // sanity; reject garbage
+
+    static const double kFps[16] =
+        { 0, 24000.0/1001, 24, 25, 30000.0/1001, 30, 50, 60000.0/1001, 60,
+          0, 0, 0, 0, 0, 0, 0 };
+    int frc = b[3] & 0x0f;
+    int bitRateValue = (b[4] << 10) | (b[5] << 2) | (b[6] >> 6);  // 18 bits, units of 400 bit/s
+
+    s->width         = w;
+    s->height        = h;
+    s->frameRateCode = frc;
+    s->frameRate     = kFps[frc];
+    s->bitRate       = (bitRateValue == 0x3ffff) ? 0 : bitRateValue * 400;  // all-ones = VBR/unknown
+    s->haveSeq       = true;
+}
+
 // Scan a Sony HDV-AUX PES body for the rec-date / rec-time / timecode packs.
 // Anchor: 0x63 ... (i+5) 0xC0..0xC3 ... (i+10) 0xFF.
 static bool scanAux(const uint8_t *b, int len, TapeMeta *out)
@@ -278,7 +300,22 @@ void HdvTsParser::Feed(const uint8_t *p)
         // payloads reconstructs the elementary stream.)
         for (int i = payloadStart; i < TS; i++)
         {
-            vidShift_ = (vidShift_ << 8) | p[i];
+            uint8_t byte = p[i];
+            vidShift_ = (vidShift_ << 8) | byte;
+
+            // Collect the bytes following a sequence_header start code (set
+            // below on the iteration that detected the B3; the B3 itself is
+            // not collected). Works across packet boundaries.
+            if (seqNeed_ > 0)
+            {
+                seqBuf_[seqGot_++] = byte;
+                if (seqGot_ >= (int)sizeof(seqBuf_))
+                {
+                    parseSeqHeader(seqBuf_, &stats_);
+                    seqNeed_ = 0;
+                }
+            }
+
             if (vidShift_ == 0x00000100)        // picture_start_code
             {
                 stats_.pictures++;
@@ -289,6 +326,11 @@ void HdvTsParser::Feed(const uint8_t *p)
                 if (stats_.gops > 0) stats_.lastGopPictures = gopPics_;
                 gopPics_ = 0;
                 stats_.gops++;
+            }
+            else if (vidShift_ == 0x000001b3 && !stats_.haveSeq)  // sequence_header
+            {
+                seqNeed_ = (int)sizeof(seqBuf_);
+                seqGot_  = 0;
             }
         }
     }
