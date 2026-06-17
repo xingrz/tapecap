@@ -115,6 +115,16 @@ them away:
    reverse positioning.
    These were written without on-hardware testing in the dev sandbox; the rate
    default and timeouts are tunable and want validation on the HC9.
+8. **`wind start` / `wind end` reach the blank head/tail** that `cue`/`--seek`
+   can't (no timecode there). Same WIND opcode `0xC4` (rewind `0x65` / fast-fwd
+   `0x75`); completion is detected by polling the AV/C TRANSPORT STATE status
+   (`ReadTransportState`, opcode `0xD0`) and stopping when the deck is no longer
+   in WIND mode (`0xC4`) / its wind sub-state is STOP (`0x60`) — i.e. it auto-
+   stopped at the mechanical end. The first "stopped" reading is ignored until
+   winding is confirmed (pre-ramp). Decks that don't answer `0xD0` fall back to
+   `--timeout` (default 900 s) or Ctrl-C. Needed for the full-reel flow: rewind
+   before a from-top capture, and the blank leader trips EOT so that capture
+   wants `--eot-timeout 0`. **Unvalidated on hardware** — wants HC9 testing.
 
 ### dvmeta specifics
 

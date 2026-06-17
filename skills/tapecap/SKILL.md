@@ -50,13 +50,14 @@ make            # -> build/tapecap (universal arm64 + x86_64)
 make install    # optional, -> /usr/local/bin
 ```
 
-## The three commands
+## The commands
 
 ```
 tapecap list                       # enumerate connected FireWire AV/C devices
 tapecap info    [--guid <hex>]     # show a deck's capabilities, mode, timecode
 tapecap capture [options] [output] # capture the raw stream (omit output to auto-name)
 tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a timecode
+tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>  # rewind to start / wind to end
 ```
 
 ### Recommended workflow
@@ -119,6 +120,12 @@ tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
 
 # Position only — fast-wind to 30:00 and stop, then capture however you like:
 tapecap cue 00:30:00
+
+# Rewind to the very beginning (the blank head, where cue/seek can't reach):
+tapecap wind start
+
+# Fast-wind to the very end of the tape:
+tapecap wind end
 ```
 
 ## Targeted re-capture / orchestration (e.g. with tapeflow)
@@ -145,6 +152,43 @@ Key things to get right when driving this:
   cue the deck, then run `capture --no-control` itself.
 - The capture output is still the untouched raw stream; keep treating each
   re-captured segment as an archival fragment to hand back to tapeflow.
+
+## Winding to the blank head/tail (`wind`)
+
+`cue`/`--seek` target a **timecode**, so they only work where the tape carries
+timecode — i.e. over recorded footage. The **head and tail of a tape are blank
+and have no timecode**, so cue can't reach them. Use `wind` for those:
+
+- **`tapecap wind start`** rewinds to the very beginning.
+- **`tapecap wind end`** fast-winds to the very end.
+
+`tapecap` drives the AV/C transport and watches the deck's transport state,
+stopping when the deck auto-stops at the mechanical end/start. If a deck doesn't
+report its transport state, fall back to Ctrl-C or `--timeout <sec>` (default
+900). This is position-only; it never captures.
+
+## Full-reel capture, and leaving the tape as you found it
+
+When archiving a whole tape from the top, mind these — they trip up agents:
+
+- **Rewind first.** Start a full capture from the beginning with
+  `tapecap wind start`, then `tapecap capture`.
+- **The blank head trips the end-of-tape timeout.** A tape usually starts with a
+  blank, signal-less leader. On a from-the-top capture that silence looks exactly
+  like end-of-tape, so the default `--eot-timeout` (5000 ms) **fires immediately
+  and the capture stops before any footage**. For a full-reel capture, **disable
+  it with `--eot-timeout 0`** (and bound the run another way, e.g. `--duration`,
+  Ctrl-C, or just let it run to the real end) or raise it well above the leader
+  length. Don't report a 0-byte/instant capture as "end of tape" — suspect this.
+- **After a full capture the deck sits in the blank tail.** It has run past the
+  last footage into the blank end, where there's no timecode, so a follow-up
+  `cue`/`--seek` has nothing to lock onto and won't position correctly. **Run
+  `tapecap wind start` first** to bring the tape back over recorded footage (where
+  timecode exists again) before any further cue/seek operations.
+- **Finish by rewinding.** Once all captures are done and the user confirms
+  there's nothing more to grab, **`tapecap wind start`** to return the tape to its
+  original (rewound) state. Leaving the tape fully rewound is part of completing
+  the job — don't consider the task done until the tape is back at the start.
 
 ## What you get out, and post-processing
 
@@ -179,9 +223,10 @@ smaller or more compatible derivative, and keep it separate from the master.
 - **No live timecode on a non-Sony HDV deck.** Only Sony's HDV AUX timecode path
   is parsed; the JVC/Canon GOP-user-data fallback isn't. This affects the live
   *display only* — the raw capture is complete and unaffected.
-- **Capture stops too early.** A quiet/blank section can trip the end-of-tape
-  silence timeout. Raise `--eot-timeout` or set it to `0` to disable, and/or use
-  `--duration` to bound the capture instead.
+- **Capture stops too early / 0 bytes captured.** A quiet/blank section trips the
+  end-of-tape silence timeout — most often the **blank leader at the very start**
+  on a from-the-top capture. Set `--eot-timeout 0` (or raise it), and/or bound the
+  capture with `--duration` instead. See "Full-reel capture" above.
 
 ## Notes & limits
 

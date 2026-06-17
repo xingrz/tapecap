@@ -113,6 +113,7 @@ tapecap list                       # list connected FireWire AV/C devices
 tapecap info    [--guid <hex>]     # show device capabilities, mode, timecode
 tapecap capture [options] [output] # capture raw stream (omit output to auto-name)
 tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a timecode
+tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>  # rewind to start / wind to end
 ```
 
 ### Capture options
@@ -159,6 +160,10 @@ tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
 
 # Position only — fast-wind the tape to 30:00 and stop, without capturing:
 tapecap cue 00:30:00
+
+# Rewind to the very beginning, or fast-wind to the very end (blank, no timecode):
+tapecap wind start
+tapecap wind end
 ```
 
 ### Targeted re-capture (`--seek` / `--until` / `cue`)
@@ -184,6 +189,22 @@ orchestrator that prefers to cue the deck and then run `capture --no-control`.
 By default `tapecap` issues an AV/C **PLAY** when capture starts and **STOP**
 when it ends, so you can leave the deck alone. Use `--no-control` if you prefer
 to drive playback yourself (or the deck ignores AV/C transport commands).
+
+### Winding to the ends (`wind start` / `wind end`)
+
+`cue`/`--seek` target a **timecode**, so they only reach recorded footage. The
+blank **head and tail** of a tape have no timecode, so use `wind` for those:
+`tapecap wind start` rewinds to the very beginning, `tapecap wind end` fast-winds
+to the very end. It drives the transport and watches the deck's transport state,
+stopping when the deck auto-stops at the mechanical end; if a deck doesn't report
+that state, stop it with Ctrl-C or bound it with `--timeout <sec>` (default 900).
+
+When **archiving a whole tape**: `tapecap wind start` first, then capture. Two
+gotchas — the blank leader at the very start looks like end-of-tape and trips the
+silence timeout, so pass **`--eot-timeout 0`** for a from-the-top capture; and
+after a full pass the deck is parked in the blank tail (no timecode), so run
+`tapecap wind start` before any further `cue`/`--seek`, and again at the end to
+leave the tape rewound.
 
 ## Permissions
 

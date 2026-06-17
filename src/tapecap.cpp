@@ -375,6 +375,27 @@ static bool ReadTapeTcSeconds(AVCDevice *dev, long *outSec)
     return false;
 }
 
+// Best-effort read of the AV/C tape TRANSPORT STATE (opcode 0xD0). On success
+// *mode is the transport mode (e.g. kAVCTapeTportModeWind 0xC4 while winding)
+// and *state the sub-state operand (e.g. kTapeWindFastFwd / kTapeWindStop);
+// *stable is false while the deck reports "in transition". Returns false if the
+// deck doesn't answer — not every deck implements this status inquiry.
+static bool ReadTransportState(AVCDevice *dev, UInt8 *mode, UInt8 *state, bool *stable)
+{
+    UInt8 cmd[4]   = { kAVCStatusInquiryCommand, IOAVCAddress(kAVCTapeRecorder, 0),
+                       kAVCTapeTransportStateOpcode, 0x7F };
+    UInt8 resp[8]  = { 0 };
+    UInt32 respLen = sizeof(resp);
+    if (dev->AVCCommand(cmd, sizeof(cmd), resp, &respLen) != kIOReturnSuccess || respLen < 4)
+        return false;
+    if (resp[0] != kAVCImplementedStatus && resp[0] != kAVCInTransitionStatus)
+        return false;
+    *mode   = resp[2];
+    *state  = resp[3];
+    *stable = (resp[0] == kAVCImplementedStatus);
+    return true;
+}
+
 // Parse a timecode argument into whole seconds. Accepts HH:MM:SS[:FF] (frames
 // ignored), MM:SS, or a bare integer number of seconds.
 static bool ParseTimecodeArg(const char *s, long *out)
@@ -609,6 +630,71 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
     if (ReadTapeTcSeconds(dev, &fin))
     { char b[16]; Info("seek: stopped at %s.", FormatHMS(fin, b, sizeof b)); }
     return reached;
+}
+
+// Fast-wind the tape to a physical extreme — the very end (forward) or the very
+// start (rewind) — and stop when the deck gets there. The head and tail of a
+// tape are blank with no timecode, so cue/seek can't target them; this just
+// drives the transport until the deck auto-stops at the mechanical end. We poll
+// the AV/C transport state to detect that auto-stop; if the deck won't report it
+// we fall back to the timeout (or Ctrl-C). Returns true once the end/start is
+// reached, false on interrupt or an unconfirmed timeout.
+static bool WindToTapeEnd(AVCDevice *dev, bool forward, long timeoutSec)
+{
+    const UInt8 windOp = forward ? kTapeWindFastFwd : kTapeWindRewind;
+    const char *label  = forward ? "FAST FORWARD" : "REWIND";
+
+    if (!SendTransportOrWarn(dev, kAVCTapeWindOpcode, windOp, label))
+        return false;
+
+    const double started = NowMono();
+    double lastReport    = started;
+    bool   sawWinding    = false;   // confirmed the transport actually started moving
+    bool   canQuery      = false;   // deck answers the transport-state inquiry
+
+    while (!gStopRequested.load())
+    {
+        usleep(400 * 1000);
+        const double now = NowMono();
+        if (now - started > (double)timeoutSec)
+        { Info("wind: timed out after %lds; stopping.", timeoutSec); break; }
+
+        UInt8 mode = 0, state = 0; bool stable = false;
+        if (ReadTransportState(dev, &mode, &state, &stable))
+        {
+            canQuery = true;
+            const bool winding = (mode == kAVCTapeTportModeWind) && (state != kTapeWindStop);
+            if (winding) sawWinding = true;
+
+            // Done once a stable reading says we're no longer winding — the deck
+            // auto-stopped at the physical end/start. Ignore the brief pre-ramp
+            // window so the initial "stopped" reading can't end us early.
+            if (stable && !winding && (sawWinding || now - started > 4.0))
+            {
+                Info("wind: reached the %s of the tape.", forward ? "end" : "start");
+                SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+                return true;
+            }
+        }
+
+        if (now - lastReport >= 3.0)
+        {
+            lastReport = now;
+            long tc; char b[16];
+            if (ReadTapeTcSeconds(dev, &tc))
+                Info("wind: %s… at %s (%.0fs)", label, FormatHMS(tc, b, sizeof b), now - started);
+            else
+                Info("wind: %s… (%.0fs, blank/no timecode)", label, now - started);
+        }
+    }
+
+    SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+    usleep(300 * 1000);
+    if (gStopRequested.load()) { Info("wind: interrupted."); return false; }
+    if (!canQuery)
+        Info("wind: this deck does not report transport state, so the stop point "
+             "isn't confirmed — watch the deck and use Ctrl-C, or set --timeout.");
+    return false;
 }
 
 enum DetectedFormat { kFmtUnknown, kFmtDV, kFmtHDV };
@@ -1272,6 +1358,59 @@ static int CmdCue(const CueOptions &opt)
     return ok ? 0 : 2;
 }
 
+struct WindOptions
+{
+    UInt64 guid       = 0;
+    bool   toEnd      = false;   // true = fast-forward to end, false = rewind to start
+    bool   haveDir    = false;
+    long   timeoutSec = 900;     // safety backstop if the deck never reports a stop
+};
+
+// Position-only: fast-wind to the physical end or start of the tape. The blank
+// head/tail carries no timecode, so cue/seek can't reach it — this is the way to
+// rewind a full reel to the top, or run the deck to the end.
+static int CmdWind(const WindOptions &opt)
+{
+    StringLogger logger(FrameworkLog);
+    AVCDeviceController *controller = nullptr;
+    if (CreateAVCDeviceController(&controller, nullptr, nullptr) != kIOReturnSuccess || !controller)
+    {
+        Info("error: could not create AVC device controller (is the FireWire driver present?)");
+        return 1;
+    }
+    WaitForDevices(controller, 3000);
+
+    AVCDevice *dev = SelectDevice(controller, opt.guid);
+    if (!dev)
+    {
+        Info("error: no DV/HDV device found. Try 'tapecap list'.");
+        DestroyAVCDeviceController(controller);
+        return 2;
+    }
+    dev->discoverAVCDeviceCapabilities();
+
+    if (dev->openDevice(DeviceMessageProc, nullptr) != kIOReturnSuccess)
+    {
+        Info("error: could not open device '%s'. Another app may be using it,", dev->deviceName);
+        Info("       or capture permission was denied (see README: permissions).");
+        DestroyAVCDeviceController(controller);
+        return 1;
+    }
+    if (!dev->hasTapeSubunit)
+        Info("warning: device did not report a tape subunit; attempting AV/C transport anyway.");
+
+    signal(SIGINT, HandleSignal);
+    signal(SIGTERM, HandleSignal);
+
+    Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
+    Info("Winding to the %s of the tape… (Ctrl-C to stop)", opt.toEnd ? "end" : "start");
+    bool ok = WindToTapeEnd(dev, opt.toEnd, opt.timeoutSec);
+
+    dev->closeDevice();
+    DestroyAVCDeviceController(controller);
+    return ok ? 0 : 2;
+}
+
 // ---------------------------------------------------------------------------
 // Usage / argument parsing
 // ---------------------------------------------------------------------------
@@ -1285,6 +1424,7 @@ static void Usage(FILE *f)
 "  tapecap info    [--guid <hex>]\n"
 "  tapecap capture [options] [output]\n"
 "  tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>\n"
+"  tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>\n"
 "  tapecap --help | --version\n"
 "\n"
 "CAPTURE OPTIONS:\n"
@@ -1307,6 +1447,12 @@ static void Usage(FILE *f)
 "position is approximate; --overlap deliberately keeps extra footage on each\n"
 "side so re-capture windows overlap (use it for tapeflow gap re-capture).\n"
 "\n"
+"'wind start' rewinds to the very beginning and 'wind end' fast-winds to the\n"
+"very end. The blank head/tail has no timecode, so cue can't reach it — use\n"
+"'wind' there instead. After a full-reel capture the deck sits in the blank\n"
+"tail; 'wind start' brings it back to where cue/seek work again, and leaves the\n"
+"tape rewound when you're done.\n"
+"\n"
 "While capturing, a live status line (tape timecode, recording date/time, size,\n"
 "frame count, and a transport continuity-error count) is shown in place on\n"
 "stderr. For HDV it also reports the streams present and the video format.\n"
@@ -1320,7 +1466,9 @@ static void Usage(FILE *f)
 "  tapecap capture --format dv reel.dv\n"
 "  tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv\n"
 "  tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t   # re-capture one gap\n"
-"  tapecap cue 00:30:00                       # just wind the tape to 30:00\n",
+"  tapecap cue 00:30:00                       # just wind the tape to 30:00\n"
+"  tapecap wind start                         # rewind to the very beginning\n"
+"  tapecap wind end                           # fast-wind to the very end\n",
     kTapecapVersion);
 }
 
@@ -1455,6 +1603,25 @@ int main(int argc, char **argv)
         }
         if (!opt.haveTarget) { Info("error: 'cue' needs a target timecode"); return 2; }
         return CmdCue(opt);
+    }
+
+    if (cmd == "wind")
+    {
+        WindOptions opt;
+        for (int i = 2; i < argc; i++)
+        {
+            std::string a = argv[i];
+            if (a == "--guid")          opt.guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
+            else if (a == "--timeout")  { opt.timeoutSec = atol(NextArg(argc, argv, i, "--timeout")); if (opt.timeoutSec <= 0) opt.timeoutSec = 900; }
+            else if (a == "-v" || a == "--verbose") gVerboseLog = true;
+            else if (a == "start" || a == "rewind" || a == "begin") { opt.toEnd = false; opt.haveDir = true; }
+            else if (a == "end" || a == "ff")                       { opt.toEnd = true;  opt.haveDir = true; }
+            else if (!a.empty() && a[0] == '-')
+            { Info("error: unknown option for 'wind': %s", a.c_str()); return 2; }
+            else { Info("error: 'wind' direction must be 'start' or 'end' (got '%s')", a.c_str()); return 2; }
+        }
+        if (!opt.haveDir) { Info("error: 'wind' needs a direction: 'start' or 'end'"); return 2; }
+        return CmdWind(opt);
     }
 
     Info("error: unknown command '%s'", cmd.c_str());
