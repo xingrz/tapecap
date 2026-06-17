@@ -92,9 +92,26 @@ them away:
    replaced with NTSC SD (`0x00`) so the receiver doesn't reject it.
 4. **Transport control** (AV/C to the tape subunit, addr `IOAVCAddress(kAVCTapeRecorder,0)`):
    PLAY = opcode `0xC3` operand `0x75`; STOP = WIND opcode `0xC4` operand `0x60`.
+   Fast-wind for seeking uses the same WIND opcode `0xC4`: high-speed forward
+   `0x75`, high-speed rewind `0x45` (operands from the vendored
+   `TapeSubunitController.h` — the authoritative table; don't guess them).
 5. Only **output plug 0** is used.
 6. **Metadata parsing is best-effort and must never affect the raw bytes.** If
    `dvmeta` has a bug, capture still writes a correct file.
+7. **Seeking is best-effort and coarse — never assume continuous timecode.**
+   `--seek` / `--until` / `cue` (in `SeekToTimecode()`) reposition the tape for
+   targeted gap re-capture (e.g. driven by *tapeflow*). The position comes from
+   the AV/C TIME CODE **status** query (`ReadTapeTcSeconds`, opcode `0x51`), not
+   the isoch stream — HDV decks emit no usable stream during high-speed wind. The
+   user confirmed real decks drop timecode mid-travel on **aged** tapes (the
+   whole reason re-capture exists), so the seek estimates the wind rate from
+   whatever samples arrive and **dead-reckons across blackouts**, stopping to
+   re-anchor. It deliberately stops `--overlap` seconds short so coasting
+   overshoot leaves *more* pre-roll (the safe direction); precision is not a
+   goal — overlap for the merge step is. `--until` stops on the live **stream**
+   timecode (valid during normal play), with `--duration`/EOT as backstops.
+   These were written without on-hardware testing in the dev sandbox; the rate
+   default and timeouts are tunable and want validation on the HC9.
 
 ### dvmeta specifics
 

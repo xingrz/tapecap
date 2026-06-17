@@ -46,6 +46,8 @@ static const char *kTapecapVersion = "0.1.0";
 // ---------------------------------------------------------------------------
 static const UInt8 kTapePlayForward = 0x75;  // PLAY  opcode 0xC3, normal-speed forward
 static const UInt8 kTapeWindStop    = 0x60;  // WIND  opcode 0xC4, stop transport
+static const UInt8 kTapeWindFastFwd = 0x75;  // WIND  opcode 0xC4, high-speed forward
+static const UInt8 kTapeWindRewind  = 0x45;  // WIND  opcode 0xC4, high-speed reverse
 
 // ---------------------------------------------------------------------------
 // Global stop signalling (set from a Unix signal handler and from callbacks
@@ -115,6 +117,17 @@ struct CaptureState
         std::lock_guard<std::mutex> lk(metaMutex);
         if (!haveHdvStats) return false;
         *out = hdvStats;
+        return true;
+    }
+
+    // Most recent tape timecode parsed from the stream, in whole seconds (frames
+    // dropped). False until a timecode has been decoded — on an aged tape that
+    // has lost its signal this can stay false, so callers must keep a backstop.
+    bool getLiveTcSeconds(long *out) const
+    {
+        std::lock_guard<std::mutex> lk(metaMutex);
+        if (!haveLatestMeta || !latestMeta.haveTc) return false;
+        *out = (long)latestMeta.tcH * 3600 + latestMeta.tcM * 60 + latestMeta.tcS;
         return true;
     }
 };
@@ -310,6 +323,187 @@ static bool ReadTimecode(AVCDevice *dev, char *buf, size_t buflen)
         return true;
     }
     return false;
+}
+
+// Same AV/C TIME CODE status inquiry as ReadTimecode(), but returns the tape
+// position in whole seconds (frames ignored — seeking is coarse). Rejects
+// obviously-bogus BCD so a garbled reply doesn't derail a seek.
+static bool ReadTapeTcSeconds(AVCDevice *dev, long *outSec)
+{
+    UInt8 cmd[8]   = { kAVCStatusInquiryCommand, IOAVCAddress(kAVCTapeRecorder, 0),
+                       0x51 /* TIME CODE */, 0x71, 0xFF, 0xFF, 0xFF, 0xFF };
+    UInt8 resp[8]  = { 0 };
+    UInt32 respLen = sizeof(resp);
+    if (dev->AVCCommand(cmd, sizeof(cmd), resp, &respLen) == kIOReturnSuccess &&
+        resp[0] == kAVCImplementedStatus)
+    {
+        unsigned h = BcdToBin(resp[7]), m = BcdToBin(resp[6]), s = BcdToBin(resp[5]);
+        if (h > 23 || m > 59 || s > 59) return false;
+        *outSec = (long)h * 3600 + (long)m * 60 + (long)s;
+        return true;
+    }
+    return false;
+}
+
+// Parse a timecode argument into whole seconds. Accepts HH:MM:SS[:FF] (frames
+// ignored), MM:SS, or a bare integer number of seconds.
+static bool ParseTimecodeArg(const char *s, long *out)
+{
+    if (!s || !*s) return false;
+    int a, b, c, d;
+    if (sscanf(s, "%d:%d:%d:%d", &a, &b, &c, &d) == 4)
+        { if (b > 59 || c > 59) return false; *out = (long)a * 3600 + b * 60 + c; return true; }
+    if (sscanf(s, "%d:%d:%d", &a, &b, &c) == 3)
+        { if (b > 59 || c > 59) return false; *out = (long)a * 3600 + b * 60 + c; return true; }
+    if (sscanf(s, "%d:%d", &a, &b) == 2)
+        { if (b > 59) return false; *out = (long)a * 60 + b; return true; }
+    char *end = nullptr;
+    long v = strtol(s, &end, 10);
+    if (end && *end == '\0' && v >= 0) { *out = v; return true; }
+    return false;
+}
+
+static const char *FormatHMS(long sec, char *buf, size_t n)
+{
+    if (sec < 0) sec = 0;
+    snprintf(buf, n, "%02ld:%02ld:%02ld", sec / 3600, (sec / 60) % 60, sec % 60);
+    return buf;
+}
+
+static double NowMono()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// Fast-wind the tape to roughly `targetSec` (tape timecode, in seconds),
+// deliberately stopping `overlapSec` BEFORE it so the capture that follows has
+// pre-roll that overlaps the previous good section.
+//
+// Tape seeking is inherently coarse — decks coast past a stop, and (the reason
+// tapeflow exists) aged tapes lose their timecode mid-travel. So this does not
+// assume a continuous timecode: it reads the AV/C TIME CODE status when it can,
+// estimates the wind rate from whatever samples arrive, and dead-reckons across
+// blackouts, periodically stopping to re-anchor. Coasting overshoot lands the
+// tape a little further from the target (i.e. more pre-roll), which is the safe
+// direction. Returns true if it confirmed a position at/inside the goal.
+static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
+{
+    long goal = targetSec - overlapSec;
+    if (goal < 0) goal = 0;
+
+    // Where are we now? An idle deck may not report timecode; nudge it with a
+    // brief play, then stop again.
+    long cur = 0;
+    bool have = ReadTapeTcSeconds(dev, &cur);
+    if (!have)
+    {
+        SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
+        usleep(800 * 1000);
+        have = ReadTapeTcSeconds(dev, &cur);
+        SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+        usleep(300 * 1000);
+    }
+    if (!have)
+    {
+        Info("seek: cannot read tape timecode; capturing from the current position.");
+        return false;
+    }
+
+    char b1[16], b2[16], b3[16];
+    Info("seek: at %s, target %s, stopping ~%lds early at %s.",
+         FormatHMS(cur, b1, sizeof b1), FormatHMS(targetSec, b2, sizeof b2),
+         overlapSec, FormatHMS(goal, b3, sizeof b3));
+
+    const long tol = 2;  // seconds — close enough, no winding needed
+    if (labs(cur - goal) <= tol) { Info("seek: already in range."); return true; }
+
+    bool  forward  = goal > cur;
+    UInt8 windOp   = forward ? kTapeWindFastFwd : kTapeWindRewind;
+    double rate    = 15.0;   // tape-seconds per wall-second; refined from samples
+    bool   haveRate = false;
+    long   lastTc  = cur;
+    double lastAt  = NowMono();
+    double started = lastAt;
+    long   stallTc = cur;
+    double stallAt = lastAt;
+    int    blindChecks = 0;
+    bool   reached = false;
+
+    SendTransport(dev, kAVCTapeWindOpcode, windOp);
+
+    while (!gStopRequested.load())
+    {
+        usleep(250 * 1000);
+        double now = NowMono();
+        if (now - started > 1200.0) { Info("seek: timed out; stopping."); break; }
+
+        long tc;
+        if (ReadTapeTcSeconds(dev, &tc))
+        {
+            double dtWall = now - lastAt;
+            long   dtTape = tc - lastTc;
+            if (dtWall > 0.4 && ((forward && dtTape > 0) || (!forward && dtTape < 0)))
+            {
+                double r = (double)labs(dtTape) / dtWall;
+                rate = haveRate ? (rate * 0.5 + r * 0.5) : r;
+                haveRate = true;
+            }
+            lastTc = tc; lastAt = now; blindChecks = 0;
+
+            if (labs(tc - stallTc) >= 1) { stallTc = tc; stallAt = now; }
+            else if (now - stallAt > 12.0)
+            { Info("seek: transport not advancing (end of tape?); stopping."); break; }
+
+            if ((forward && tc >= goal) || (!forward && tc <= goal)) { reached = true; break; }
+        }
+        else
+        {
+            // Blackout: predict where we are by dead reckoning.
+            double pred = (double)lastTc + (forward ? 1.0 : -1.0) * rate * (now - lastAt);
+            if ((forward && pred >= goal) || (!forward && pred <= goal))
+            {
+                // Believed to be at the goal — stop and try to confirm.
+                SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+                usleep(500 * 1000);
+                if (ReadTapeTcSeconds(dev, &tc))
+                {
+                    lastTc = tc; lastAt = NowMono(); stallTc = tc; stallAt = lastAt;
+                    if ((forward && tc >= goal) || (!forward && tc <= goal)) { reached = true; break; }
+                    forward = goal > tc;
+                    windOp  = forward ? kTapeWindFastFwd : kTapeWindRewind;
+                    SendTransport(dev, kAVCTapeWindOpcode, windOp);
+                }
+                else
+                {
+                    Info("seek: timecode lost in this region; stopping at the estimated position.");
+                    return true;  // tape already stopped
+                }
+            }
+            else if (now - lastAt > 6.0)
+            {
+                // Long blackout, not yet at goal — stop to re-anchor.
+                SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+                usleep(500 * 1000);
+                long t2;
+                if (ReadTapeTcSeconds(dev, &t2)) { lastTc = t2; lastAt = NowMono(); blindChecks = 0; }
+                else if (++blindChecks >= 4)
+                { Info("seek: cannot re-acquire timecode; stopping at the estimated position."); return true; }
+                else { lastAt = NowMono(); }  // advance anchor to avoid a tight loop
+                forward = goal > lastTc;
+                windOp  = forward ? kTapeWindFastFwd : kTapeWindRewind;
+                SendTransport(dev, kAVCTapeWindOpcode, windOp);
+            }
+        }
+    }
+
+    SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+    usleep(300 * 1000);
+    long fin;
+    if (ReadTapeTcSeconds(dev, &fin))
+    { char b[16]; Info("seek: stopped at %s.", FormatHMS(fin, b, sizeof b)); }
+    return reached;
 }
 
 enum DetectedFormat { kFmtUnknown, kFmtDV, kFmtHDV };
@@ -593,6 +787,11 @@ struct CaptureOptions
     int          eotTimeoutMs = 5000;      // 0 = never auto-stop on silence
     bool         control     = true;       // send PLAY/STOP
     bool         verbose     = false;
+    bool         seek        = false;      // fast-wind to seekSec before capturing
+    long         seekSec     = 0;          // target tape timecode (seconds)
+    bool         until       = false;      // stop once the tape timecode passes untilSec
+    long         untilSec    = 0;          // stop tape timecode (seconds)
+    long         overlapSec  = 4;          // pre-/post-roll kept around a [seek,until] window
 };
 
 static int CmdCapture(const CaptureOptions &opt)
@@ -707,6 +906,21 @@ static int CmdCapture(const CaptureOptions &opt)
 
     st.isHdv = useHdv;
 
+    // Optional fast-wind to the requested start timecode (tapeflow re-capture).
+    // Runs after format detection — which may itself have briefly rolled the
+    // tape — and leaves the transport stopped, so the normal PLAY below rolls
+    // again from the sought position.
+    if (opt.seek)
+    {
+        if (!dev->hasTapeSubunit)
+            Info("warning: device has no tape subunit; ignoring --seek.");
+        else
+        {
+            SeekToTimecode(dev, opt.seekSec, opt.overlapSec);
+            playStarted = false;
+        }
+    }
+
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
     Info("Format:  %s", useHdv ? "HDV (raw MPEG-2 TS)" : "DV (raw DIF)");
     Info("Output:  %s", toStdout ? "<stdout>"
@@ -801,6 +1015,15 @@ static int CmdCapture(const CaptureOptions &opt)
             reason = "duration reached";
             break;
         }
+        if (opt.until)
+        {
+            long tc;
+            if (st.getLiveTcSeconds(&tc) && tc >= opt.untilSec + opt.overlapSec)
+            {
+                reason = "until timecode reached";
+                break;
+            }
+        }
 
         if (st.isHdv && !announcedStreams)
             announcedStreams = AnnounceHdvStreams(st);
@@ -886,6 +1109,64 @@ static int CmdCapture(const CaptureOptions &opt)
     return 0;
 }
 
+struct CueOptions
+{
+    UInt64 guid       = 0;
+    long   targetSec  = 0;
+    long   overlapSec = 0;   // default: land on the target (no pre-roll)
+    bool   haveTarget = false;
+};
+
+// Position-only: fast-wind the tape to a timecode and stop, without capturing.
+// Lets an orchestrator (tapeflow) cue the deck, then run `capture --no-control`.
+static int CmdCue(const CueOptions &opt)
+{
+    StringLogger logger(FrameworkLog);
+    AVCDeviceController *controller = nullptr;
+    if (CreateAVCDeviceController(&controller, nullptr, nullptr) != kIOReturnSuccess || !controller)
+    {
+        Info("error: could not create AVC device controller (is the FireWire driver present?)");
+        return 1;
+    }
+    WaitForDevices(controller, 3000);
+
+    AVCDevice *dev = SelectDevice(controller, opt.guid);
+    if (!dev)
+    {
+        Info("error: no DV/HDV device found. Try 'tapecap list'.");
+        DestroyAVCDeviceController(controller);
+        return 2;
+    }
+    dev->discoverAVCDeviceCapabilities();
+
+    if (dev->openDevice(DeviceMessageProc, nullptr) != kIOReturnSuccess)
+    {
+        Info("error: could not open device '%s'. Another app may be using it,", dev->deviceName);
+        Info("       or capture permission was denied (see README: permissions).");
+        DestroyAVCDeviceController(controller);
+        return 1;
+    }
+    if (!dev->hasTapeSubunit)
+    {
+        Info("error: device has no tape subunit; cannot drive the transport.");
+        dev->closeDevice();
+        DestroyAVCDeviceController(controller);
+        return 2;
+    }
+
+    signal(SIGINT, HandleSignal);
+    signal(SIGTERM, HandleSignal);
+
+    char b[16];
+    Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
+    Info("Cueing to %s…", FormatHMS(opt.targetSec, b, sizeof b));
+    bool ok = SeekToTimecode(dev, opt.targetSec, opt.overlapSec);
+
+    dev->closeDevice();
+    DestroyAVCDeviceController(controller);
+    return ok ? 0 : 2;
+}
+
 // ---------------------------------------------------------------------------
 // Usage / argument parsing
 // ---------------------------------------------------------------------------
@@ -898,6 +1179,7 @@ static void Usage(FILE *f)
 "  tapecap list\n"
 "  tapecap info    [--guid <hex>]\n"
 "  tapecap capture [options] [output]\n"
+"  tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>\n"
 "  tapecap --help | --version\n"
 "\n"
 "CAPTURE OPTIONS:\n"
@@ -905,10 +1187,19 @@ static void Usage(FILE *f)
 "  --format <fmt>      auto | dv | hdv             (default: auto-detect)\n"
 "  --duration <sec>    Stop after N seconds        (default: until Ctrl-C / EOT)\n"
 "  --eot-timeout <ms>  Stop after this much silence; 0 disables   (default: 5000)\n"
+"  --seek <timecode>   Fast-wind to this tape timecode before capturing\n"
+"  --until <timecode>  Stop once the tape timecode passes this point\n"
+"  --overlap <sec>     Pre-/post-roll kept around --seek/--until    (default: 4)\n"
 "  --no-control        Do NOT send AV/C PLAY/STOP (press play on the deck yourself)\n"
 "  -v, --verbose       Also print the framework's internal log on stderr\n"
 "  [output]            File to write. Omit to auto-name from the recording's\n"
 "                      date/time; use '-' to write to stdout.\n"
+"\n"
+"A <timecode> is HH:MM:SS (or HH:MM:SS:FF — frames ignored, MM:SS, or seconds).\n"
+"--seek/--until/cue drive the transport, so they need AV/C control (not\n"
+"--no-control). Tape seeking is coarse and aged tapes drop timecode, so the\n"
+"position is approximate; --overlap deliberately keeps extra footage on each\n"
+"side so re-capture windows overlap (use it for tapeflow gap re-capture).\n"
 "\n"
 "While capturing, a live status line (tape timecode, recording date/time, size,\n"
 "frame count, and a transport continuity-error count) is shown in place on\n"
@@ -921,7 +1212,9 @@ static void Usage(FILE *f)
 "  tapecap list\n"
 "  tapecap capture                            # auto-detect, auto-name e.g. 20101029-140926.m2t\n"
 "  tapecap capture --format dv reel.dv\n"
-"  tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv\n",
+"  tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv\n"
+"  tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t   # re-capture one gap\n"
+"  tapecap cue 00:30:00                       # just wind the tape to 30:00\n",
     kTapecapVersion);
 }
 
@@ -982,6 +1275,23 @@ int main(int argc, char **argv)
             else if (a == "--format")      opt.format = NextArg(argc, argv, i, "--format");
             else if (a == "--duration")    opt.durationSec = atoi(NextArg(argc, argv, i, "--duration"));
             else if (a == "--eot-timeout") opt.eotTimeoutMs = atoi(NextArg(argc, argv, i, "--eot-timeout"));
+            else if (a == "--seek")
+            {
+                opt.seek = true;
+                if (!ParseTimecodeArg(NextArg(argc, argv, i, "--seek"), &opt.seekSec))
+                { Info("error: --seek wants a timecode (HH:MM:SS[:FF], MM:SS, or seconds)"); return 2; }
+            }
+            else if (a == "--until")
+            {
+                opt.until = true;
+                if (!ParseTimecodeArg(NextArg(argc, argv, i, "--until"), &opt.untilSec))
+                { Info("error: --until wants a timecode (HH:MM:SS[:FF], MM:SS, or seconds)"); return 2; }
+            }
+            else if (a == "--overlap")
+            {
+                opt.overlapSec = atol(NextArg(argc, argv, i, "--overlap"));
+                if (opt.overlapSec < 0) opt.overlapSec = 0;
+            }
             else if (a == "--no-control")  opt.control = false;
             else if (a == "-v" || a == "--verbose") { opt.verbose = true; gVerboseLog = true; }
             else if (!a.empty() && a[0] == '-' && a != "-")
@@ -1005,7 +1315,40 @@ int main(int argc, char **argv)
             Info("error: --format must be auto, dv or hdv");
             return 2;
         }
+        if (opt.seek && !opt.control)
+        {
+            Info("error: --seek needs transport control; cannot combine with --no-control");
+            return 2;
+        }
+        if (opt.seek && opt.until && opt.untilSec <= opt.seekSec)
+        {
+            Info("error: --until must be later than --seek");
+            return 2;
+        }
         return CmdCapture(opt);
+    }
+
+    if (cmd == "cue")
+    {
+        CueOptions opt;
+        for (int i = 2; i < argc; i++)
+        {
+            std::string a = argv[i];
+            if (a == "--guid")         opt.guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
+            else if (a == "--overlap") { opt.overlapSec = atol(NextArg(argc, argv, i, "--overlap")); if (opt.overlapSec < 0) opt.overlapSec = 0; }
+            else if (a == "-v" || a == "--verbose") gVerboseLog = true;
+            else if (!a.empty() && a[0] == '-')
+            { Info("error: unknown option for 'cue': %s", a.c_str()); return 2; }
+            else
+            {
+                if (opt.haveTarget) { Info("error: 'cue' takes one timecode"); return 2; }
+                if (!ParseTimecodeArg(a.c_str(), &opt.targetSec))
+                { Info("error: bad timecode '%s' (use HH:MM:SS[:FF], MM:SS, or seconds)", a.c_str()); return 2; }
+                opt.haveTarget = true;
+            }
+        }
+        if (!opt.haveTarget) { Info("error: 'cue' needs a target timecode"); return 2; }
+        return CmdCue(opt);
     }
 
     Info("error: unknown command '%s'", cmd.c_str());

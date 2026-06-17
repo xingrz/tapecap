@@ -56,6 +56,7 @@ make install    # optional, -> /usr/local/bin
 tapecap list                       # enumerate connected FireWire AV/C devices
 tapecap info    [--guid <hex>]     # show a deck's capabilities, mode, timecode
 tapecap capture [options] [output] # capture the raw stream (omit output to auto-name)
+tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a timecode
 ```
 
 ### Recommended workflow
@@ -80,6 +81,9 @@ Ctrl-C, or end of tape.
 | `--format auto\|dv\|hdv` | Force the stream format. Default `auto` detects from the deck's output-plug signal format. Override only if a deck misreports (`tapecap info` shows what was detected). |
 | `--duration <sec>` | Stop after N seconds (default: until Ctrl-C / end of tape). |
 | `--eot-timeout <ms>` | Auto-stop after this much stream silence; `0` disables (default: 5000). |
+| `--seek <timecode>` | Fast-wind to this tape timecode before capturing (targeted re-capture). Needs AV/C control. |
+| `--until <timecode>` | Stop once the captured stream's timecode passes this point. |
+| `--overlap <sec>` | Pre-/post-roll kept around `--seek` / `--until` (default: 4) so re-capture windows overlap. |
 | `--no-control` | Don't send AV/C PLAY/STOP — the user presses play on the deck themselves. Use for decks that ignore AV/C transport commands, or to capture mid-tape. |
 | `-v`, `--verbose` | Also print the framework's internal log to stderr. |
 | `[output]` | File to write. **Omit** to auto-name from the recording's date/time; use `-` to stream to stdout. |
@@ -109,7 +113,38 @@ tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv
 
 # Pick a specific deck by GUID:
 tapecap capture --guid 0x0800460102345678
+
+# Re-capture just one damaged section by tape timecode (e.g. a tapeflow gap):
+tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
+
+# Position only — fast-wind to 30:00 and stop, then capture however you like:
+tapecap cue 00:30:00
 ```
+
+## Targeted re-capture / orchestration (e.g. with tapeflow)
+
+[tapeflow](https://github.com/xingrz/tapeflow) merges several capture passes of a
+worn tape and reports the **remaining gaps, each labelled with a timecode**. To
+re-capture one gap without replaying the whole tape, use `--seek <tc>` (fast-wind
+to the start) and `--until <tc>` (stop after the end) — `tapecap` drives the deck
+with AV/C high-speed forward/rewind. Use this when the user wants to automate or
+speed up filling tapeflow's gaps.
+
+Key things to get right when driving this:
+
+- **A `<timecode>` is `HH:MM:SS`** (also `HH:MM:SS:FF` with frames ignored,
+  `MM:SS`, or a bare number of seconds).
+- **Seeking is coarse, on purpose.** Decks coast past a stop, and aged tapes (the
+  reason for re-capturing) drop their timecode mid-travel, so the landing point is
+  approximate. `--overlap <sec>` (default 4) keeps extra footage on both sides so
+  each re-capture **overlaps** the neighbouring good material — exactly what the
+  merge step needs. Don't try to make it frame-accurate; lean on overlap instead.
+- **`--seek`/`--until`/`cue` need AV/C control**, so they can't be combined with
+  `--no-control`.
+- **`cue <tc>` positions only** (no capture) — for an orchestrator that prefers to
+  cue the deck, then run `capture --no-control` itself.
+- The capture output is still the untouched raw stream; keep treating each
+  re-captured segment as an archival fragment to hand back to tapeflow.
 
 ## What you get out, and post-processing
 
