@@ -513,11 +513,14 @@ static void PrintLiveStatus(CaptureState &st, time_t startTime)
     // frames for DV. Either way, 0 is the live "clean capture" reassurance.
     unsigned long long errs = st.isHdv ? (haveStats ? s.ccErrors : 0)
                                        : st.dropped.load();
+    // Coded-frame count: true picture count for HDV, DV frames for DV.
+    unsigned long long frames = st.isHdv ? (haveStats ? s.pictures : 0)
+                                         : st.framesOrPackets.load();
 
     long el = (long)(time(nullptr) - startTime);
     std::string sz = HumanSize(st.bytesWritten.load());
-    fprintf(stderr, "\r  tc %s   rec %s   %s   err %llu   (%ld:%02ld)        ",
-            tcbuf, recbuf, sz.c_str(), errs, el / 60, el % 60);
+    fprintf(stderr, "\r  tc %s   rec %s   %s   %llu fr   err %llu   (%ld:%02ld)        ",
+            tcbuf, recbuf, sz.c_str(), frames, errs, el / 60, el % 60);
     fflush(stderr);
 }
 
@@ -828,9 +831,20 @@ static int CmdCapture(const CaptureOptions &opt)
              st.dropped.load());
     {
         tapecap::HdvStats s;
-        if (st.isHdv && st.getHdvStats(&s) && s.ccErrors)
-            Info("Note: %llu transport continuity error(s) — possible tape damage or dropped packets.",
-                 s.ccErrors);
+        if (st.isHdv && st.getHdvStats(&s))
+        {
+            if (s.pictures)
+            {
+                std::string line = "HDV video: " + std::to_string(s.pictures)
+                                 + " frames in " + std::to_string(s.gops) + " GOP(s)";
+                if (s.lastGopPictures)
+                    line += " (last GOP " + std::to_string(s.lastGopPictures) + " frames)";
+                Info("%s", line.c_str());
+            }
+            if (s.ccErrors)
+                Info("Note: %llu transport continuity error(s) — possible tape damage or dropped packets.",
+                     s.ccErrors);
+        }
     }
 
     if (st.writeError) return 1;

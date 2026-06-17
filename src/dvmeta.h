@@ -50,6 +50,13 @@ struct HdvStats
     // adaptation field flagging a discontinuity — dropped/garbled packets, i.e.
     // a tape/transport damage signal. Counted, never acted on.
     unsigned long long ccErrors = 0;
+
+    // MPEG-2 video structure, from start codes in the video ES. `pictures` is
+    // the true coded-frame count (one picture_header each); `gops` counts GOP
+    // headers; `lastGopPictures` is the size of the most recent complete GOP.
+    unsigned long long pictures = 0;
+    unsigned long long gops     = 0;
+    int                lastGopPictures = 0;
 };
 
 // Parse one raw DV frame (DIF). Fills whatever it finds into *out and returns
@@ -75,6 +82,8 @@ private:
     TapeMeta meta_;
     HdvStats stats_;
     std::map<int, int> lastCc_;   // PID -> last continuity_counter seen
+    uint32_t vidShift_ = 0xffffffff;  // rolling last 4 bytes of the video ES
+    int      gopPics_  = 0;           // picture_headers in the GOP in progress
 };
 
 } // namespace tapecap

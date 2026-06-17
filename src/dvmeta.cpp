@@ -269,6 +269,29 @@ void HdvTsParser::Feed(const uint8_t *p)
             stats_.audioStreamType = audioType;
         }
     }
+    else if (videoPid_ >= 0 && pid == videoPid_)
+    {
+        // Walk the video ES bytes through a rolling 4-byte window and count the
+        // MPEG-2 start codes we care about. The window persists across packets,
+        // so a start code straddling a TS boundary is still caught. (The
+        // adaptation field, skipped above, is not ES data — concatenating
+        // payloads reconstructs the elementary stream.)
+        for (int i = payloadStart; i < TS; i++)
+        {
+            vidShift_ = (vidShift_ << 8) | p[i];
+            if (vidShift_ == 0x00000100)        // picture_start_code
+            {
+                stats_.pictures++;
+                gopPics_++;
+            }
+            else if (vidShift_ == 0x000001b8)   // group_of_pictures_header
+            {
+                if (stats_.gops > 0) stats_.lastGopPictures = gopPics_;
+                gopPics_ = 0;
+                stats_.gops++;
+            }
+        }
+    }
     else if (auxPid_ >= 0 && pid == auxPid_ && pusi)
     {
         // AUX PES header: 00 00 01 BF len(2); body follows.
