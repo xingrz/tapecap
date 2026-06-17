@@ -37,7 +37,7 @@ using namespace AVS;
 // ---------------------------------------------------------------------------
 // Version
 // ---------------------------------------------------------------------------
-static const char *kTapecapVersion = "0.2.0";
+static const char *kTapecapVersion = "0.3.0";
 
 // ---------------------------------------------------------------------------
 // AV/C tape-transport command operands (subunit-level CONTROL commands).
