@@ -59,6 +59,14 @@ See [`docs/BACKGROUND.md`](docs/BACKGROUND.md) for the gory details.
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install xingrz/tap/tapecap
+```
+
+(Installs the prebuilt universal binary; no quarantine step needed.)
+
 ### Download a build
 
 Each push produces a universal binary via GitHub Actions — grab the
