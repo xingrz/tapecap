@@ -94,6 +94,18 @@ make            # -> build/tapecap (universal arm64 + x86_64)
 make install    # optional, installs to /usr/local/bin
 ```
 
+## Agent skill
+
+Rather have an AI coding assistant drive tapecap for you? Install the bundled
+[skill](skills/tapecap/SKILL.md) into your agent (Claude Code, etc.):
+
+```sh
+npx skills add xingrz/tapecap
+```
+
+It teaches the agent to enumerate FireWire devices, inspect a deck, capture the
+untouched DV/HDV bitstream, and losslessly post-process the result.
+
 ## Usage
 
 ```
