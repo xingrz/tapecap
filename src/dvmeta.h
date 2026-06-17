@@ -32,6 +32,20 @@ struct TapeMeta
     int  tcH = 0, tcM = 0, tcS = 0, tcF = 0;
 };
 
+// Live diagnostics for an HDV (MPEG-2 TS) capture, accumulated by HdvTsParser as
+// packets stream by. Best-effort, never affects the bytes written to disk. All
+// fields are zero/false until the relevant structure has been seen.
+struct HdvStats
+{
+    // Stream layout, learned from the PMT. The whole point of tapecap is that
+    // these (audio + private metadata) survive — AVFoundation drops them.
+    bool haveStreams = false;   // PMT has been parsed
+    bool haveVideo   = false;   // an MPEG video ES is present (stream_type 0x01/0x02)
+    bool haveAudio   = false;   // an MPEG audio ES is present (stream_type 0x03/0x04)
+    bool haveAux     = false;   // the Sony HDV timecode AUX stream (0xA1/0xA0) is present
+    int  audioStreamType = 0;   // 0x03 = MPEG-1 audio, 0x04 = MPEG-2 audio
+};
+
 // Parse one raw DV frame (DIF). Fills whatever it finds into *out and returns
 // true if either a recording date/time or a timecode was decoded.
 bool DvParseFrame(const uint8_t *data, size_t len, TapeMeta *out);
@@ -45,6 +59,7 @@ class HdvTsParser
 public:
     void Feed(const uint8_t *pkt188);
     bool Latest(TapeMeta *out) const;   // false until something has been decoded
+    HdvStats Stats() const { return stats_; }
 
 private:
     int  pmtPid_   = -1;
@@ -52,6 +67,7 @@ private:
     int  videoPid_ = -1;
     bool have_     = false;
     TapeMeta meta_;
+    HdvStats stats_;
 };
 
 } // namespace tapecap

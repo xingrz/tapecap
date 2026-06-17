@@ -79,11 +79,14 @@ struct CaptureState
     // on the callback thread; the snapshots below are shared with the main
     // thread and guarded by metaMutex.
     tapecap::HdvTsParser     hdvParser;
+    bool                     isHdv = false;     // selects HDV-specific diagnostics
     mutable std::mutex       metaMutex;
     tapecap::TapeMeta        latestMeta;        // most recent (for live display)
     bool                     haveLatestMeta = false;
     tapecap::TapeMeta        firstMeta;         // first rec date/time (for auto-name)
     bool                     haveFirstMeta = false;
+    tapecap::HdvStats        hdvStats;          // latest HDV diagnostics snapshot
+    bool                     haveHdvStats = false;
 
     // Record a freshly decoded metadata snapshot (called from the callback).
     void recordMeta(const tapecap::TapeMeta &m)
@@ -96,6 +99,23 @@ struct CaptureState
             firstMeta = m;
             haveFirstMeta = true;
         }
+    }
+
+    // Record the HDV parser's running diagnostics (called from the callback).
+    void recordHdvStats(const tapecap::HdvStats &s)
+    {
+        std::lock_guard<std::mutex> lk(metaMutex);
+        hdvStats = s;
+        haveHdvStats = true;
+    }
+
+    // Snapshot the HDV diagnostics for the main thread. False until first set.
+    bool getHdvStats(tapecap::HdvStats *out) const
+    {
+        std::lock_guard<std::mutex> lk(metaMutex);
+        if (!haveHdvStats) return false;
+        *out = hdvStats;
+        return true;
     }
 };
 
@@ -144,6 +164,7 @@ static IOReturn MpegDataProc(UInt32 tsPacketCount, UInt32 **ppBuf, void *refcon)
     tapecap::TapeMeta m;
     if (st->hdvParser.Latest(&m))
         st->recordMeta(m);
+    st->recordHdvStats(st->hdvParser.Stats());
     return kIOReturnSuccess;
 }
 
@@ -434,6 +455,37 @@ static std::string HumanSize(unsigned long long bytes)
     return b;
 }
 
+// Erase the in-place status line so a normal log line prints cleanly. No-op
+// unless stderr is a TTY (otherwise there is no '\r' line to clear).
+static void ClearStatusLine()
+{
+    if (isatty(fileno(stderr)))
+        fprintf(stderr, "\r%80s\r", "");
+}
+
+// HDV only: once the PMT has been parsed, print a single line confirming which
+// elementary streams are present — the reassurance that the audio and the
+// timecode AUX (both dropped by AVFoundation) are actually being captured.
+// Returns true once it has printed, so the caller stops asking.
+static bool AnnounceHdvStreams(const CaptureState &st)
+{
+    tapecap::HdvStats s;
+    if (!st.getHdvStats(&s) || !s.haveStreams) return false;
+
+    const char *audioName = s.audioStreamType == 0x03 ? "MPEG-1 Layer II"
+                          : s.audioStreamType == 0x04 ? "MPEG-2 audio"
+                          : "audio";
+    std::string line = "Stream:  ";
+    line += s.haveVideo ? "video" : "(no video)";
+    if (s.haveAudio) { line += " + audio ("; line += audioName; line += ")"; }
+    else             { line += " + (no audio in PMT)"; }
+    line += s.haveAux ? " + timecode-AUX" : " + (no timecode-AUX)";
+
+    ClearStatusLine();
+    Info("%s", line.c_str());
+    return true;
+}
+
 // One-line live status on stderr (in-place via '\r'): tape timecode, recording
 // date/time, bytes captured and elapsed time. Fields only grow once decoded, so
 // the trailing pad is enough to avoid leftover characters.
@@ -623,6 +675,8 @@ static int CmdCapture(const CaptureOptions &opt)
         }
     }
 
+    st.isHdv = useHdv;
+
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
     Info("Format:  %s", useHdv ? "HDV (raw MPEG-2 TS)" : "DV (raw DIF)");
     Info("Output:  %s", toStdout ? "<stdout>"
@@ -694,6 +748,7 @@ static int CmdCapture(const CaptureOptions &opt)
 
     // Main wait loop. Show a live status line in place when stderr is a TTY.
     const bool showProgress = isatty(fileno(stderr));
+    bool announcedStreams = false;
     time_t start = time(nullptr);
     const char *reason = "stopped";
     while (true)
@@ -716,6 +771,8 @@ static int CmdCapture(const CaptureOptions &opt)
             break;
         }
 
+        if (st.isHdv && !announcedStreams)
+            announcedStreams = AnnounceHdvStreams(st);
         if (showProgress)
             PrintLiveStatus(st, start);
     }

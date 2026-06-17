@@ -140,20 +140,25 @@ static int parsePat(const uint8_t *p, int payloadStart)
     return -1;
 }
 
-// PMT -> AUX PID (prefer Sony 0xA1, else 0xA0) and video PID.
-static void parsePmt(const uint8_t *p, int payloadStart, int *auxPid, int *videoPid)
+// PMT -> AUX PID (prefer Sony 0xA1, else 0xA0), video PID, and audio PID/type.
+// Out-params for streams we don't care about (audioPid/audioType) may be null.
+// Returns true if a PMT table section was found and parsed at this packet.
+static bool parsePmt(const uint8_t *p, int payloadStart,
+                     int *auxPid, int *videoPid, int *audioPid, int *audioType)
 {
     *auxPid = -1; *videoPid = -1;
+    if (audioPid)  *audioPid  = -1;
+    if (audioType) *audioType = 0;
     int pointer    = p[payloadStart];
     int tableStart = payloadStart + 1 + pointer;
-    if (tableStart + 12 > TS) return;
-    if (p[tableStart] != 0x02) return;
+    if (tableStart + 12 > TS) return false;
+    if (p[tableStart] != 0x02) return false;
     int sectionLength      = ((p[tableStart + 1]  & 0x0f) << 8) | p[tableStart + 2];
     int programInfoLength  = ((p[tableStart + 10] & 0x0f) << 8) | p[tableStart + 11];
     int q   = tableStart + 12 + programInfoLength;
     int end = tableStart + 3 + sectionLength - 4;
     if (end > TS) end = TS;
-    int a1 = -1, a0 = -1, vid = -1;
+    int a1 = -1, a0 = -1, vid = -1, aud = -1, audType = 0;
     while (q + 5 <= end)
     {
         int streamType   = p[q];
@@ -162,10 +167,14 @@ static void parsePmt(const uint8_t *p, int payloadStart, int *auxPid, int *video
         if (a1 < 0 && streamType == 0xa1) a1 = pid;
         if (a0 < 0 && streamType == 0xa0) a0 = pid;
         if (vid < 0 && (streamType == 0x01 || streamType == 0x02)) vid = pid;
+        if (aud < 0 && (streamType == 0x03 || streamType == 0x04)) { aud = pid; audType = streamType; }
         q += 5 + esInfoLength;
     }
     *auxPid   = (a1 >= 0) ? a1 : a0;
     *videoPid = vid;
+    if (audioPid)  *audioPid  = aud;
+    if (audioType) *audioType = audType;
+    return true;
 }
 
 // Scan a Sony HDV-AUX PES body for the rec-date / rec-time / timecode packs.
@@ -227,9 +236,17 @@ void HdvTsParser::Feed(const uint8_t *p)
     {
         pmtPid_ = parsePat(p, payloadStart);
     }
-    else if (pmtPid_ >= 0 && pid == pmtPid_ && auxPid_ < 0)
+    else if (pmtPid_ >= 0 && pid == pmtPid_ && pusi && !stats_.haveStreams)
     {
-        parsePmt(p, payloadStart, &auxPid_, &videoPid_);
+        int audioPid = -1, audioType = 0;
+        if (parsePmt(p, payloadStart, &auxPid_, &videoPid_, &audioPid, &audioType))
+        {
+            stats_.haveStreams     = true;
+            stats_.haveVideo       = (videoPid_ >= 0);
+            stats_.haveAux         = (auxPid_ >= 0);
+            stats_.haveAudio       = (audioPid >= 0);
+            stats_.audioStreamType = audioType;
+        }
     }
     else if (auxPid_ >= 0 && pid == auxPid_ && pusi)
     {
