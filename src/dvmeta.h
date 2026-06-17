@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 
 namespace tapecap {
 
@@ -44,6 +45,11 @@ struct HdvStats
     bool haveAudio   = false;   // an MPEG audio ES is present (stream_type 0x03/0x04)
     bool haveAux     = false;   // the Sony HDV timecode AUX stream (0xA1/0xA0) is present
     int  audioStreamType = 0;   // 0x03 = MPEG-1 audio, 0x04 = MPEG-2 audio
+
+    // Transport continuity breaks: a PID's continuity_counter jumped without the
+    // adaptation field flagging a discontinuity — dropped/garbled packets, i.e.
+    // a tape/transport damage signal. Counted, never acted on.
+    unsigned long long ccErrors = 0;
 };
 
 // Parse one raw DV frame (DIF). Fills whatever it finds into *out and returns
@@ -68,6 +74,7 @@ private:
     bool have_     = false;
     TapeMeta meta_;
     HdvStats stats_;
+    std::map<int, int> lastCc_;   // PID -> last continuity_counter seen
 };
 
 } // namespace tapecap

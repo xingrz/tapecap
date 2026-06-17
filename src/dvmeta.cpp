@@ -228,6 +228,27 @@ void HdvTsParser::Feed(const uint8_t *p)
     int b1   = p[1];
     int pid  = ((b1 & 0x1f) << 8) | p[2];
     int pusi = (b1 >> 6) & 1;                 // payload_unit_start_indicator
+    int afc  = (p[3] >> 4) & 0x3;             // adaptation_field_control
+
+    // Continuity-counter check — the TS damage signal. CC increments by 1
+    // (mod 16) per *payload-bearing* packet of a PID; a jump the adaptation
+    // field's discontinuity_indicator does not flag means dropped/garbled
+    // packets. We only count breaks here — capture is never interrupted.
+    if (pid != 0x1fff && (afc == 1 || afc == 3))   // null packets carry no CC
+    {
+        int  cc      = p[3] & 0x0f;
+        bool discont = (afc == 3 && p[4] > 0 && (p[5] & 0x80));  // discontinuity_indicator
+        auto it = lastCc_.find(pid);
+        if (it != lastCc_.end() && !discont)
+        {
+            int expected = (it->second + 1) & 0x0f;
+            // The expected next value is fine; a single repeated packet (cc
+            // unchanged) is legal too. Anything else is a continuity break.
+            if (cc != expected && cc != it->second)
+                stats_.ccErrors++;
+        }
+        lastCc_[pid] = cc;
+    }
 
     int payloadStart = tsPayloadStart(p);
     if (payloadStart < 0) return;

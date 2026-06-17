@@ -492,11 +492,14 @@ static bool AnnounceHdvStreams(const CaptureState &st)
 static void PrintLiveStatus(CaptureState &st, time_t startTime)
 {
     tapecap::TapeMeta m;
-    bool haveMeta = false;
+    tapecap::HdvStats s;
+    bool haveMeta = false, haveStats = false;
     {
         std::lock_guard<std::mutex> lk(st.metaMutex);
         haveMeta = st.haveLatestMeta;
         if (haveMeta) m = st.latestMeta;
+        haveStats = st.haveHdvStats;
+        if (haveStats) s = st.hdvStats;
     }
     char tcbuf[16]  = "--:--:--:--";
     char recbuf[24] = "------------------";
@@ -506,10 +509,15 @@ static void PrintLiveStatus(CaptureState &st, time_t startTime)
         snprintf(recbuf, sizeof(recbuf), "%04d-%02d-%02d %02d:%02d:%02d",
                  m.year, m.month, m.day, m.hour, m.minute, m.second);
 
+    // Error count: transport continuity breaks for HDV, dropped/corrupted
+    // frames for DV. Either way, 0 is the live "clean capture" reassurance.
+    unsigned long long errs = st.isHdv ? (haveStats ? s.ccErrors : 0)
+                                       : st.dropped.load();
+
     long el = (long)(time(nullptr) - startTime);
     std::string sz = HumanSize(st.bytesWritten.load());
-    fprintf(stderr, "\r  tc %s   rec %s   %s   (%ld:%02ld)        ",
-            tcbuf, recbuf, sz.c_str(), el / 60, el % 60);
+    fprintf(stderr, "\r  tc %s   rec %s   %s   err %llu   (%ld:%02ld)        ",
+            tcbuf, recbuf, sz.c_str(), errs, el / 60, el % 60);
     fflush(stderr);
 }
 
@@ -818,6 +826,12 @@ static int CmdCapture(const CaptureOptions &opt)
     if (st.dropped.load())
         Info("Note: %llu dropped/corrupted frame(s) — check the FireWire cable/connection.",
              st.dropped.load());
+    {
+        tapecap::HdvStats s;
+        if (st.isHdv && st.getHdvStats(&s) && s.ccErrors)
+            Info("Note: %llu transport continuity error(s) — possible tape damage or dropped packets.",
+                 s.ccErrors);
+    }
 
     if (st.writeError) return 1;
     if (st.bytesWritten.load() == 0)
