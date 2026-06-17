@@ -45,9 +45,10 @@ static const char *kTapecapVersion = "0.1.0";
 // match the AV/C Tape Recorder/Player spec (and libavc1394 / dvgrab).
 // ---------------------------------------------------------------------------
 static const UInt8 kTapePlayForward = 0x75;  // PLAY  opcode 0xC3, normal-speed forward
+static const UInt8 kTapePlayReverse = 0x65;  // PLAY  opcode 0xC3, normal-speed reverse
 static const UInt8 kTapeWindStop    = 0x60;  // WIND  opcode 0xC4, stop transport
 static const UInt8 kTapeWindFastFwd = 0x75;  // WIND  opcode 0xC4, high-speed forward
-static const UInt8 kTapeWindRewind  = 0x45;  // WIND  opcode 0xC4, high-speed reverse
+static const UInt8 kTapeWindRewind  = 0x65;  // WIND  opcode 0xC4, rewind toward tape start
 
 // ---------------------------------------------------------------------------
 // Global stop signalling (set from a Unix signal handler and from callbacks
@@ -298,12 +299,41 @@ static const char *FormatName(AVCDevice *d)
 // ---------------------------------------------------------------------------
 // AV/C helpers
 // ---------------------------------------------------------------------------
-static IOReturn SendTransport(AVCDevice *dev, UInt8 opcode, UInt8 operand)
+static const char *AvcResponseName(UInt8 response)
+{
+    switch (response)
+    {
+        case kAVCAcceptedStatus:       return "accepted";
+        case kAVCRejectedStatus:       return "rejected";
+        case kAVCNotImplementedStatus: return "not implemented";
+        case kAVCImplementedStatus:    return "implemented/status";
+        case kAVCInTransitionStatus:   return "in transition";
+        default:                       return "unknown";
+    }
+}
+
+static IOReturn SendTransport(AVCDevice *dev, UInt8 opcode, UInt8 operand,
+                              UInt8 *outResponse = nullptr)
 {
     UInt8 cmd[4]   = { kAVCControlCommand, IOAVCAddress(kAVCTapeRecorder, 0), opcode, operand };
     UInt8 resp[8]  = { 0 };
     UInt32 respLen = sizeof(resp);
-    return dev->AVCCommand(cmd, sizeof(cmd), resp, &respLen);
+    IOReturn r = dev->AVCCommand(cmd, sizeof(cmd), resp, &respLen);
+    UInt8 response = respLen > 0 ? resp[0] : 0xFF;
+    if (outResponse) *outResponse = response;
+    if (r != kIOReturnSuccess) return r;
+    return response == kAVCAcceptedStatus ? kIOReturnSuccess : kIOReturnError;
+}
+
+static bool SendTransportOrWarn(AVCDevice *dev, UInt8 opcode, UInt8 operand,
+                                const char *name)
+{
+    UInt8 response = 0xFF;
+    IOReturn r = SendTransport(dev, opcode, operand, &response);
+    if (r == kIOReturnSuccess) return true;
+    Info("warning: %s command was not accepted (IOReturn 0x%08X, AV/C 0x%02X %s).",
+         name, r, response, AvcResponseName(response));
+    return false;
 }
 
 static unsigned BcdToBin(unsigned v) { return ((v >> 4) * 10) + (v & 0x0F); }
@@ -377,6 +407,61 @@ static double NowMono()
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static bool FineSeekToTimecode(AVCDevice *dev, long goal, long cur)
+{
+    bool forward = goal > cur;
+    UInt8 playOp = forward ? kTapePlayForward : kTapePlayReverse;
+    const char *name = forward ? "PLAY" : "REVERSE PLAY";
+    if (!SendTransportOrWarn(dev, kAVCTapePlayOpcode, playOp, name))
+        return false;
+
+    long lastTc = cur;
+    double lastMoveAt = NowMono();
+    double started = lastMoveAt;
+    double timeout = (double)labs(goal - cur) + 8.0;
+    if (timeout < 10.0) timeout = 10.0;
+
+    bool reached = false;
+    while (!gStopRequested.load())
+    {
+        usleep(200 * 1000);
+        double now = NowMono();
+        if (now - started > timeout)
+        {
+            Info("seek: fine positioning timed out; stopping.");
+            break;
+        }
+
+        long tc;
+        if (!ReadTapeTcSeconds(dev, &tc))
+            continue;
+
+        if (labs(tc - lastTc) >= 1)
+        {
+            lastTc = tc;
+            lastMoveAt = now;
+        }
+        else if (now - lastMoveAt > 5.0)
+        {
+            Info("seek: fine positioning is not advancing; stopping.");
+            break;
+        }
+
+        if ((forward && tc >= goal) || (!forward && tc <= goal))
+        {
+            reached = true;
+            break;
+        }
+    }
+
+    SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+    usleep(300 * 1000);
+    long fin;
+    if (ReadTapeTcSeconds(dev, &fin))
+    { char b[16]; Info("seek: stopped at %s.", FormatHMS(fin, b, sizeof b)); }
+    return reached;
+}
+
 // Fast-wind the tape to roughly `targetSec` (tape timecode, in seconds),
 // deliberately stopping `overlapSec` BEFORE it so the capture that follows has
 // pre-roll that overlaps the previous good section.
@@ -399,11 +484,13 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
     bool have = ReadTapeTcSeconds(dev, &cur);
     if (!have)
     {
-        SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
-        usleep(800 * 1000);
-        have = ReadTapeTcSeconds(dev, &cur);
-        SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
-        usleep(300 * 1000);
+        if (SendTransportOrWarn(dev, kAVCTapePlayOpcode, kTapePlayForward, "PLAY"))
+        {
+            usleep(800 * 1000);
+            have = ReadTapeTcSeconds(dev, &cur);
+            SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+            usleep(300 * 1000);
+        }
     }
     if (!have)
     {
@@ -416,8 +503,14 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
          FormatHMS(cur, b1, sizeof b1), FormatHMS(targetSec, b2, sizeof b2),
          overlapSec, FormatHMS(goal, b3, sizeof b3));
 
-    const long tol = 2;  // seconds — close enough, no winding needed
+    const long tol = 2;         // seconds — close enough, no winding needed
+    const long fineWindow = 20; // seconds — normal play avoids short-hop overshoot
     if (labs(cur - goal) <= tol) { Info("seek: already in range."); return true; }
+    if (labs(cur - goal) <= fineWindow)
+    {
+        Info("seek: close enough for play-speed positioning.");
+        return FineSeekToTimecode(dev, goal, cur);
+    }
 
     bool  forward  = goal > cur;
     UInt8 windOp   = forward ? kTapeWindFastFwd : kTapeWindRewind;
@@ -431,7 +524,9 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
     int    blindChecks = 0;
     bool   reached = false;
 
-    SendTransport(dev, kAVCTapeWindOpcode, windOp);
+    if (!SendTransportOrWarn(dev, kAVCTapeWindOpcode, windOp,
+                             forward ? "FAST FORWARD" : "REWIND"))
+        return false;
 
     while (!gStopRequested.load())
     {
@@ -456,6 +551,12 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
             else if (now - stallAt > 12.0)
             { Info("seek: transport not advancing (end of tape?); stopping."); break; }
 
+            if (labs(goal - tc) <= fineWindow)
+            {
+                SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+                usleep(500 * 1000);
+                return FineSeekToTimecode(dev, goal, tc);
+            }
             if ((forward && tc >= goal) || (!forward && tc <= goal)) { reached = true; break; }
         }
         else
@@ -465,7 +566,7 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
             if ((forward && pred >= goal) || (!forward && pred <= goal))
             {
                 // Believed to be at the goal — stop and try to confirm.
-                SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+                SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
                 usleep(500 * 1000);
                 if (ReadTapeTcSeconds(dev, &tc))
                 {
@@ -473,7 +574,9 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
                     if ((forward && tc >= goal) || (!forward && tc <= goal)) { reached = true; break; }
                     forward = goal > tc;
                     windOp  = forward ? kTapeWindFastFwd : kTapeWindRewind;
-                    SendTransport(dev, kAVCTapeWindOpcode, windOp);
+                    if (!SendTransportOrWarn(dev, kAVCTapeWindOpcode, windOp,
+                                             forward ? "FAST FORWARD" : "REWIND"))
+                        break;
                 }
                 else
                 {
@@ -484,7 +587,7 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
             else if (now - lastAt > 6.0)
             {
                 // Long blackout, not yet at goal — stop to re-anchor.
-                SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+                SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
                 usleep(500 * 1000);
                 long t2;
                 if (ReadTapeTcSeconds(dev, &t2)) { lastTc = t2; lastAt = NowMono(); blindChecks = 0; }
@@ -493,12 +596,14 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
                 else { lastAt = NowMono(); }  // advance anchor to avoid a tight loop
                 forward = goal > lastTc;
                 windOp  = forward ? kTapeWindFastFwd : kTapeWindRewind;
-                SendTransport(dev, kAVCTapeWindOpcode, windOp);
+                if (!SendTransportOrWarn(dev, kAVCTapeWindOpcode, windOp,
+                                         forward ? "FAST FORWARD" : "REWIND"))
+                    break;
             }
         }
     }
 
-    SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+    SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
     usleep(300 * 1000);
     long fin;
     if (ReadTapeTcSeconds(dev, &fin))
@@ -619,7 +724,8 @@ static int CmdInfo(UInt64 guid)
     printf("Supports FCP:  %s\n", dev->supportsFCP ? "yes" : "no");
     printf("Output plugs:  %u\n", (unsigned)dev->numOutputPlugs);
 
-    if (dev->openDevice(DeviceMessageProc, nullptr) == kIOReturnSuccess)
+    IOReturn openResult = dev->openDevice(DeviceMessageProc, nullptr);
+    if (openResult == kIOReturnSuccess)
     {
         // The output-plug (oPCR) format reflects what's actually on the bus and
         // is the value capture's auto-detect trusts. It can disagree with the
@@ -633,6 +739,10 @@ static int CmdInfo(UInt64 guid)
         if (ReadTimecode(dev, tc, sizeof(tc)))
             printf("Timecode:      %s\n", tc);
         dev->closeDevice();
+    }
+    else
+    {
+        printf("Open:          failed (0x%08X)\n", openResult);
     }
 
     DestroyAVCDeviceController(controller);
@@ -798,6 +908,9 @@ static int CmdCapture(const CaptureOptions &opt)
 {
     CaptureState st;
     st.verbose = opt.verbose;
+    int eotTimeoutMs = opt.eotTimeoutMs;
+    if (opt.seek && eotTimeoutMs > 0 && eotTimeoutMs < 15000)
+        eotTimeoutMs = 15000;
 
     // Open output. With no path we capture into a hidden temp file and rename it
     // to the recording's date/time (parsed from the stream) when we're done.
@@ -880,13 +993,15 @@ static int CmdCapture(const CaptureOptions &opt)
         // Some decks only expose a meaningful output-plug format once the
         // transport is actually rolling. If we can't tell yet, start playback
         // and look again before giving up.
-        if (det == kFmtUnknown && opt.control && dev->hasTapeSubunit)
+        if (det == kFmtUnknown && opt.control)
         {
             Info("Format not reported yet — starting playback to detect…");
-            SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
-            playStarted = true;
-            usleep(1500 * 1000);
-            det = DetectFormat(dev);
+            if (SendTransportOrWarn(dev, kAVCTapePlayOpcode, kTapePlayForward, "PLAY"))
+            {
+                playStarted = true;
+                usleep(1500 * 1000);
+                det = DetectFormat(dev);
+            }
         }
 
         if (det == kFmtHDV)      useHdv = true;
@@ -896,7 +1011,7 @@ static int CmdCapture(const CaptureOptions &opt)
             Info("error: could not auto-detect the stream format.");
             Info("       Make sure the deck is in Play/VTR mode, or force it with");
             Info("       --format hdv   (or --format dv).");
-            if (playStarted) SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+            if (playStarted) SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
             dev->closeDevice();
             DestroyAVCDeviceController(controller);
             cleanupOut();
@@ -913,12 +1028,9 @@ static int CmdCapture(const CaptureOptions &opt)
     if (opt.seek)
     {
         if (!dev->hasTapeSubunit)
-            Info("warning: device has no tape subunit; ignoring --seek.");
-        else
-        {
-            SeekToTimecode(dev, opt.seekSec, opt.overlapSec);
-            playStarted = false;
-        }
+            Info("warning: device did not report a tape subunit; attempting AV/C transport anyway.");
+        SeekToTimecode(dev, opt.seekSec, opt.overlapSec);
+        playStarted = false;
     }
 
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
@@ -933,8 +1045,8 @@ static int CmdCapture(const CaptureOptions &opt)
     if (useHdv)
     {
         stream = dev->CreateMPEGReceiverForDevicePlug(0, MpegDataProc, &st, nullptr, &st, &logger);
-        if (stream && stream->pMPEGReceiver && opt.eotTimeoutMs > 0)
-            stream->pMPEGReceiver->registerNoDataNotificationCallback(NoDataProc, &st, opt.eotTimeoutMs);
+        if (stream && stream->pMPEGReceiver && eotTimeoutMs > 0)
+            stream->pMPEGReceiver->registerNoDataNotificationCallback(NoDataProc, &st, eotTimeoutMs);
     }
     else
     {
@@ -952,8 +1064,8 @@ static int CmdCapture(const CaptureOptions &opt)
         stream = dev->CreateDVReceiverForDevicePlug(0, DvFrameProc, &st, nullptr, &st, &logger,
                                                     kCyclesPerDVReceiveSegment * 2,
                                                     kNumDVReceiveSegments, dvMode);
-        if (stream && stream->pDVReceiver && opt.eotTimeoutMs > 0)
-            stream->pDVReceiver->registerNoDataNotificationCallback(NoDataProc, &st, opt.eotTimeoutMs);
+        if (stream && stream->pDVReceiver && eotTimeoutMs > 0)
+            stream->pDVReceiver->registerNoDataNotificationCallback(NoDataProc, &st, eotTimeoutMs);
     }
     if (!stream)
     {
@@ -969,17 +1081,15 @@ static int CmdCapture(const CaptureOptions &opt)
     signal(SIGTERM, HandleSignal);
 
     // Roll the tape (unless detection already started it).
-    if (opt.control && dev->hasTapeSubunit && !playStarted)
+    if (opt.control && !playStarted)
     {
-        IOReturn r = SendTransport(dev, kAVCTapePlayOpcode, kTapePlayForward);
-        if (r != kIOReturnSuccess)
-            Info("warning: PLAY command was not accepted (0x%08X); press play manually if needed.", r);
+        SendTransportOrWarn(dev, kAVCTapePlayOpcode, kTapePlayForward, "PLAY");
     }
 
     if (dev->StartAVCDeviceStream(stream) != kIOReturnSuccess)
     {
         Info("error: could not start isochronous receive.");
-        if (opt.control && dev->hasTapeSubunit) SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+        if (opt.control) SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
         dev->DestroyAVCDeviceStream(stream);
         dev->closeDevice();
         DestroyAVCDeviceController(controller);
@@ -1036,8 +1146,8 @@ static int CmdCapture(const CaptureOptions &opt)
 
     // Teardown
     dev->StopAVCDeviceStream(stream);
-    if (opt.control && dev->hasTapeSubunit)
-        SendTransport(dev, kAVCTapeWindOpcode, kTapeWindStop);
+    if (opt.control)
+        SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
     dev->DestroyAVCDeviceStream(stream);
     dev->closeDevice();
     DestroyAVCDeviceController(controller);
@@ -1147,12 +1257,7 @@ static int CmdCue(const CueOptions &opt)
         return 1;
     }
     if (!dev->hasTapeSubunit)
-    {
-        Info("error: device has no tape subunit; cannot drive the transport.");
-        dev->closeDevice();
-        DestroyAVCDeviceController(controller);
-        return 2;
-    }
+        Info("warning: device did not report a tape subunit; attempting AV/C transport anyway.");
 
     signal(SIGINT, HandleSignal);
     signal(SIGTERM, HandleSignal);
@@ -1186,7 +1291,8 @@ static void Usage(FILE *f)
 "  --guid <hex>        Select device by GUID (default: first DV/HDV device)\n"
 "  --format <fmt>      auto | dv | hdv             (default: auto-detect)\n"
 "  --duration <sec>    Stop after N seconds        (default: until Ctrl-C / EOT)\n"
-"  --eot-timeout <ms>  Stop after this much silence; 0 disables   (default: 5000)\n"
+"  --eot-timeout <ms>  Stop after this much silence; 0 disables   (default: 5000;\n"
+"                      --seek uses at least 15000 for stream startup)\n"
 "  --seek <timecode>   Fast-wind to this tape timecode before capturing\n"
 "  --until <timecode>  Stop once the tape timecode passes this point\n"
 "  --overlap <sec>     Pre-/post-roll kept around --seek/--until    (default: 4)\n"

@@ -110,7 +110,7 @@ tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a ti
 | `--guid <hex>` | Pick a device by its 64-bit GUID (default: first DV/HDV device) |
 | `--format auto\|dv\|hdv` | Force the stream format (default: auto-detect from the deck) |
 | `--duration <sec>` | Stop after N seconds (default: until Ctrl-C / end of tape) |
-| `--eot-timeout <ms>` | Auto-stop after this much silence; `0` disables (default: 5000) |
+| `--eot-timeout <ms>` | Auto-stop after this much silence; `0` disables (default: 5000; `--seek` uses at least 15000 for stream startup) |
 | `--seek <timecode>` | Fast-wind to this tape timecode before capturing |
 | `--until <timecode>` | Stop once the tape timecode passes this point |
 | `--overlap <sec>` | Pre-/post-roll kept around `--seek` / `--until` (default: 4) |
@@ -154,8 +154,8 @@ tapecap cue 00:30:00
 For tools like [tapeflow](https://github.com/xingrz/tapeflow) — which capture a
 worn tape several times and merge the clean frames, leaving a list of remaining
 **gaps labelled with timecode** — `tapecap` can re-capture just one gap instead
-of replaying the whole tape. `--seek <tc>` fast-winds (AV/C high-speed
-forward/rewind) to a tape timecode before capture; `--until <tc>` stops once the
+of replaying the whole tape. `--seek <tc>` fast-winds (AV/C fast-forward/rewind)
+to a tape timecode before capture; `--until <tc>` stops once the
 captured stream's timecode passes a point.
 
 A `<timecode>` is `HH:MM:SS` (also `HH:MM:SS:FF` with frames ignored, `MM:SS`, or

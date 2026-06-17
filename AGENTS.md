@@ -92,9 +92,9 @@ them away:
    replaced with NTSC SD (`0x00`) so the receiver doesn't reject it.
 4. **Transport control** (AV/C to the tape subunit, addr `IOAVCAddress(kAVCTapeRecorder,0)`):
    PLAY = opcode `0xC3` operand `0x75`; STOP = WIND opcode `0xC4` operand `0x60`.
-   Fast-wind for seeking uses the same WIND opcode `0xC4`: high-speed forward
-   `0x75`, high-speed rewind `0x45` (operands from the vendored
-   `TapeSubunitController.h` — the authoritative table; don't guess them).
+   Fast-wind for seeking uses the same WIND opcode `0xC4`: fast-forward `0x75`
+   and rewind `0x65`. The vendored `TapeSubunitController.h` also lists
+   high-speed rewind `0x45`, but a Sony HDR-HC9 rejects it as not implemented.
 5. Only **output plug 0** is used.
 6. **Metadata parsing is best-effort and must never affect the raw bytes.** If
    `dvmeta` has a bug, capture still writes a correct file.
@@ -109,7 +109,10 @@ them away:
    re-anchor. It deliberately stops `--overlap` seconds short so coasting
    overshoot leaves *more* pre-roll (the safe direction); precision is not a
    goal — overlap for the merge step is. `--until` stops on the live **stream**
-   timecode (valid during normal play), with `--duration`/EOT as backstops.
+   timecode (valid during normal play), with `--duration`/EOT as backstops. When
+   `--seek` is used, positive EOT timeouts below 15000 ms are raised to 15000 ms
+   because the HC9 can take more than 5 seconds to resume HDV output after
+   reverse positioning.
    These were written without on-hardware testing in the dev sandbox; the rate
    default and timeouts are tunable and want validation on the HC9.
 

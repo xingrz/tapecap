@@ -80,7 +80,7 @@ Ctrl-C, or end of tape.
 | `--guid <hex>` | Pick a device by its 64-bit GUID (default: first DV/HDV device). Use when several devices are listed. |
 | `--format auto\|dv\|hdv` | Force the stream format. Default `auto` detects from the deck's output-plug signal format. Override only if a deck misreports (`tapecap info` shows what was detected). |
 | `--duration <sec>` | Stop after N seconds (default: until Ctrl-C / end of tape). |
-| `--eot-timeout <ms>` | Auto-stop after this much stream silence; `0` disables (default: 5000). |
+| `--eot-timeout <ms>` | Auto-stop after this much stream silence; `0` disables (default: 5000; `--seek` uses at least 15000 for stream startup). |
 | `--seek <timecode>` | Fast-wind to this tape timecode before capturing (targeted re-capture). Needs AV/C control. |
 | `--until <timecode>` | Stop once the captured stream's timecode passes this point. |
 | `--overlap <sec>` | Pre-/post-roll kept around `--seek` / `--until` (default: 4) so re-capture windows overlap. |
@@ -127,7 +127,7 @@ tapecap cue 00:30:00
 worn tape and reports the **remaining gaps, each labelled with a timecode**. To
 re-capture one gap without replaying the whole tape, use `--seek <tc>` (fast-wind
 to the start) and `--until <tc>` (stop after the end) — `tapecap` drives the deck
-with AV/C high-speed forward/rewind. Use this when the user wants to automate or
+with AV/C fast-forward/rewind. Use this when the user wants to automate or
 speed up filling tapeflow's gaps.
 
 Key things to get right when driving this:
