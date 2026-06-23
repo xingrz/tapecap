@@ -76,6 +76,8 @@ struct CaptureState
     std::atomic<unsigned long long> bytesWritten{0};
     std::atomic<unsigned long long> framesOrPackets{0};
     std::atomic<unsigned long long> dropped{0};
+    std::atomic<unsigned long long> wrongMode{0};
+    std::atomic<unsigned int>       firstWrongMode{0x100};
     bool        writeError   = false;
 
     // Live tape metadata parsed from the stream. The HDV parser is touched only
@@ -193,6 +195,16 @@ static IOReturn DvFrameProc(DVFrameReceiveMessage msg, DVReceiveFrame *pFrame, v
         st->dropped.fetch_add(1);
         return kIOReturnSuccess;
     }
+    if (msg == kDVFrameWrongMode)
+    {
+        st->wrongMode.fetch_add(1);
+        if (pFrame)
+        {
+            unsigned int expected = 0x100;
+            st->firstWrongMode.compare_exchange_strong(expected, pFrame->frameMode);
+        }
+        return kIOReturnSuccess;
+    }
 
     // kDVFrameReceivedSuccessfully or kDVFrameCorrupted -> data present
     if (pFrame && pFrame->pFrameData && pFrame->frameLen)
@@ -212,6 +224,11 @@ static IOReturn DvFrameProc(DVFrameReceiveMessage msg, DVReceiveFrame *pFrame, v
         tapecap::TapeMeta m;
         if (tapecap::DvParseFrame(pFrame->pFrameData, pFrame->frameLen, &m))
             st->recordMeta(m);
+
+        // DVReceiver lends frame buffers to clients. Once we have copied the
+        // raw DIF frame out, return the buffer immediately so capture can keep
+        // receiving instead of exhausting the small frame queue.
+        pFrame->pDVReceiver->releaseFrame(pFrame);
     }
     return kIOReturnSuccess;
 }
@@ -705,8 +722,12 @@ enum DetectedFormat { kFmtUnknown, kFmtDV, kFmtHDV };
 // HDR-HC9) report DV there even while streaming HDV. Mirrors AVCVideoServices'
 // outputPlugSignalFormat(). Returns kFmtHDV, kFmtDV, or kFmtUnknown.
 // Requires the device to be open.
-static DetectedFormat ReadOutputPlugFormat(AVCDevice *dev, UInt8 plug)
+static DetectedFormat ReadOutputPlugFormat(AVCDevice *dev, UInt8 plug,
+                                           UInt8 *outDvMode = nullptr,
+                                           UInt32 *outRawFormat = nullptr)
 {
+    if (outDvMode) *outDvMode = 0xFF;
+    if (outRawFormat) *outRawFormat = 0;
     UInt8 cmd[8]  = { kAVCStatusInquiryCommand, kAVCUnitAddress,
                       kAVCOutputPlugSignalFormatOpcode, plug, 0xFF, 0xFF, 0xFF, 0xFF };
     UInt8 resp[8] = { 0 };
@@ -717,8 +738,13 @@ static DetectedFormat ReadOutputPlugFormat(AVCDevice *dev, UInt8 plug)
         return kFmtUnknown;
     UInt32 fmt = ((UInt32)resp[4] << 24) | ((UInt32)resp[5] << 16) |
                  ((UInt32)resp[6] << 8)  |  (UInt32)resp[7];
+    if (outRawFormat) *outRawFormat = fmt;
     if ((fmt & 0xFF000000) == kAVCPlugSignalFormatMPEGTS) return kFmtHDV;
-    if ((fmt & 0xFF000000) == kAVCPlugSignalFormatNTSCDV) return kFmtDV;
+    if ((fmt & 0xFF000000) == kAVCPlugSignalFormatNTSCDV)
+    {
+        if (outDvMode) *outDvMode = (UInt8)((fmt & 0x00FF0000) >> 16);
+        return kFmtDV;
+    }
     return kFmtUnknown;
 }
 
@@ -817,9 +843,14 @@ static int CmdInfo(UInt64 guid)
         // is the value capture's auto-detect trusts. It can disagree with the
         // signal-mode "Format" above (e.g. Sony HDR-HC9 reports DV there while
         // streaming HDV) — so show it explicitly.
-        DetectedFormat op = ReadOutputPlugFormat(dev, 0);
-        printf("Output plug 0: %s\n",
-               op == kFmtHDV ? "HDV / MPEG-TS" : op == kFmtDV ? "DV" : "not reported (idle?)");
+        UInt8 opDvMode = 0xFF;
+        UInt32 rawSignalFormat = 0;
+        DetectedFormat op = ReadOutputPlugFormat(dev, 0, &opDvMode, &rawSignalFormat);
+        if (op == kFmtDV && opDvMode != 0xFF)
+            printf("Output plug 0: DV (mode 0x%02X, raw 0x%08X)\n", opDvMode, rawSignalFormat);
+        else
+            printf("Output plug 0: %s\n",
+                   op == kFmtHDV ? "HDV / MPEG-TS" : "not reported (idle?)");
 
         char tc[32];
         if (ReadTimecode(dev, tc, sizeof(tc)))
@@ -921,7 +952,7 @@ static void PrintLiveStatus(CaptureState &st, time_t startTime)
     // Error count: transport continuity breaks for HDV, dropped/corrupted
     // frames for DV. Either way, 0 is the live "clean capture" reassurance.
     unsigned long long errs = st.isHdv ? (haveStats ? s.ccErrors : 0)
-                                       : st.dropped.load();
+                                       : st.dropped.load() + st.wrongMode.load();
     // Coded-frame count: true picture count for HDV, DV frames for DV.
     unsigned long long frames = st.isHdv ? (haveStats ? s.pictures : 0)
                                          : st.framesOrPackets.load();
@@ -1141,6 +1172,14 @@ static int CmdCapture(const CaptureOptions &opt)
         // signal mode; if that's unknown (0xFF), fall back to NTSC SD DV25 so
         // the receiver doesn't reject it outright.
         UInt8 dvMode = dev->dvMode;
+        UInt8 opDvMode = 0xFF;
+        if (ReadOutputPlugFormat(dev, 0, &opDvMode) == kFmtDV && opDvMode != 0xFF)
+        {
+            if (dvMode != opDvMode)
+                Info("DV mode: using output-plug mode 0x%02X instead of device default 0x%02X.",
+                     opDvMode, dvMode);
+            dvMode = opDvMode;
+        }
         if (dvMode == 0xFF)
         {
             dvMode = kDVModeSD_525_60;  // 0x00
@@ -1270,6 +1309,16 @@ static int CmdCapture(const CaptureOptions &opt)
     if (st.dropped.load())
         Info("Note: %llu dropped/corrupted frame(s) — check the FireWire cable/connection.",
              st.dropped.load());
+    if (st.wrongMode.load())
+    {
+        unsigned int mode = st.firstWrongMode.load();
+        if (mode <= 0xFF)
+            Info("Note: %llu DV packet(s) had a different DV mode than the receiver expected (first seen 0x%02X).",
+                 st.wrongMode.load(), mode);
+        else
+            Info("Note: %llu DV packet(s) had a different DV mode than the receiver expected.",
+                 st.wrongMode.load());
+    }
     {
         tapecap::HdvStats s;
         if (st.isHdv && st.getHdvStats(&s))

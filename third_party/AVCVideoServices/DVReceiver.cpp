@@ -270,6 +270,15 @@ IOReturn DVReceiver::setupIsocReceiver(void)
 		return kIOReturnError ;
     }
 
+	UInt32 maxFrameBufferSize = pDVFormat->frameSize;
+	DVFormats* pBufferFormat = &dvFormats[0];
+	while (pBufferFormat->frameSize != 0)
+	{
+		if (pBufferFormat->frameSize > maxFrameBufferSize)
+			maxFrameBufferSize = pBufferFormat->frameSize;
+		pBufferFormat += 1;
+	}
+
 	pthread_mutex_lock(&frameQueueMutex);
 
 	// Allocate the video frame queue
@@ -284,12 +293,13 @@ IOReturn DVReceiver::setupIsocReceiver(void)
 		pFrame->frameSYTTime = 0;
 		pFrame->frameReceivedTimeStamp = 0;
 		pFrame->refCount = 0;
-		pFrame->frameBufferSize = 0;
+		pFrame->frameBufferSize = maxFrameBufferSize;
 		pFrame->currentOffset = 0;
 		pFrame->frameMode = 0;
 		
-		// Allocate frame buffer memory
-		pFrame->pFrameData = (UInt8*) new UInt8[pDVFormat->frameSize];
+		// Allocate frame buffer memory. Use the largest known DV frame size so
+		// the receiver can follow decks that report one mode but send another.
+		pFrame->pFrameData = (UInt8*) new UInt8[pFrame->frameBufferSize];
 		if (!pFrame->pFrameData)
 		{
 			logger->log("\nDVReceiver Error: DV frame buffer memory allocation error\n");
@@ -961,22 +971,39 @@ void DVReceiver::DVReceiveDCLCallback(void)
 					pthread_mutex_unlock(&frameQueueMutex);
 				}
 
-				// Currently, if the received DV stream is not in the same mode as this DVReceive object
-				// was initialzied for, we don't process the packets, and we alert the clients via the
-				// FrameReceived callback of the invalid mode error. In the future, handle receiving
-				// frames for modes other than the initialized mode.
+				// Some decks report one DV mode through AV/C but send another in the
+				// actual CIP header. Follow the stream mode when it is one we know.
+				bool modeOK = true;
 				if (cip_mode != dvMode)
 				{
-					pthread_mutex_lock(&frameQueueMutex);
-					for (dequeIterator = frameNotifyQueue.begin() ; dequeIterator != frameNotifyQueue.end() ; ++dequeIterator)
+					UInt8 oldDVMode = dvMode;
+					DVFormats* pOldDVFormat = pDVFormat;
+					dvMode = cip_mode;
+					if (FindDVFormatForMode() == kIOReturnSuccess)
 					{
-						pNotifyInst = *dequeIterator;
-						pNotifyInst->handler(kDVFrameWrongMode, nil,pNotifyInst->refCon);
+						logger->log("DVReceiver Info: DV mode changed from 0x%02X to 0x%02X\n", oldDVMode, dvMode);
 					}
-					
-					pthread_mutex_unlock(&frameQueueMutex);
+					else
+					{
+						dvMode = oldDVMode;
+						pDVFormat = pOldDVFormat;
+						modeOK = false;
+
+						DVReceiveFrame wrongModeFrame;
+						bzero(&wrongModeFrame, sizeof(wrongModeFrame));
+						wrongModeFrame.frameMode = cip_mode;
+						pthread_mutex_lock(&frameQueueMutex);
+						for (dequeIterator = frameNotifyQueue.begin() ; dequeIterator != frameNotifyQueue.end() ; ++dequeIterator)
+						{
+							pNotifyInst = *dequeIterator;
+							pNotifyInst->handler(kDVFrameWrongMode, &wrongModeFrame,pNotifyInst->refCon);
+						}
+
+						pthread_mutex_unlock(&frameQueueMutex);
+					}
 				}
-				else
+
+				if (modeOK)
 				{
 					// Get a frame off the queue, if available
 					pCurrentFrame = getNextQueuedFrame();

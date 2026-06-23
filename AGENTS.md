@@ -51,12 +51,16 @@ layer Premiere uses. See `docs/BACKGROUND.md` for the full write-up.
   MPEGTrickModes, the `Virtual*` device-emulation classes, FWA_IORemapper, the
   flat `FWAVC` C API, and all `*Test`/sample `main()`s) are unreferenced by the
   capture path.
-- **The only edit** to the vendored sources is in `AVCVideoServices.h`: the
-  `#include`s for those non-vendored modules were removed, and one constant
-  (`kMaxAutoPSIDetectProgramIndex`, normally in MPEGTrickModes.h) was hoisted in
-  so the compiled-but-unused `MPEG2Transmitter.cpp` still builds. The transmitter
-  compiles as dead code (the managed `AVCDevice` API references it) but tapecap
-  never transmits.
+- Vendored-source edits are intentionally small:
+  - `AVCVideoServices.h`: `#include`s for non-vendored modules were removed, and
+    one constant (`kMaxAutoPSIDetectProgramIndex`, normally in MPEGTrickModes.h)
+    was hoisted in so the compiled-but-unused `MPEG2Transmitter.cpp` still
+    builds. The transmitter compiles as dead code (the managed `AVCDevice` API
+    references it) but tapecap never transmits.
+  - `DVReceiver.cpp`: DV frame buffers are sized for the largest known DV frame,
+    and the receiver follows the actual CIP `dvMode` when a deck reports one DV
+    mode via AV/C but sends another on the bus (seen on Sony HDV-VCR with PAL DV
+    footage misreported as NTSC DV).
 
 ## Hard platform constraints
 

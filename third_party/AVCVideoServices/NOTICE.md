@@ -30,9 +30,14 @@ capture path references them: `PanelSubunitController`, `MusicSubunitController`
 `MPEGTrickModes`, the `Virtual*` device-emulation classes, `FWA_IORemapper`, the
 flat `FWAVC` C wrapper, and all of the `*Test` / sample `main()` programs.
 
-The only edit to the vendored sources is in `AVCVideoServices.h`, where the
-`#include` lines for those non-vendored modules were removed. Every file keeps
-its original Apple copyright header.
+The vendored sources have two local compatibility edits:
+
+- `AVCVideoServices.h`: `#include` lines for non-vendored modules were removed.
+- `DVReceiver.cpp`: receive buffers are sized for the largest known DV frame,
+  and the receiver follows the actual CIP DV mode when a deck reports one mode
+  via AV/C but sends another on the bus.
+
+Every file keeps its original Apple copyright header.
 
 ## License
 
