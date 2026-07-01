@@ -107,18 +107,20 @@ them away:
    targeted gap re-capture (e.g. driven by *tapeflow*). The position comes from
    the AV/C TIME CODE **status** query (`ReadTapeTcSeconds`, opcode `0x51`), not
    the isoch stream — HDV decks emit no usable stream during high-speed wind. The
-   user confirmed real decks drop timecode mid-travel on **aged** tapes (the
-   whole reason re-capture exists), so the seek estimates the wind rate from
-   whatever samples arrive and **dead-reckons across blackouts**, stopping to
-   re-anchor. It deliberately stops `--overlap` seconds short so coasting
+   seek needs a readable current tape timecode anchor as well as a target
+   timecode; from the blank head/tail there is no anchor, so it must fail rather
+   than falling back to capture from the current physical position. DV supports
+   this too; it is not HDV-only. The user confirmed real decks drop timecode
+   mid-travel on **aged** tapes (the whole reason re-capture exists), so the
+   seek estimates the wind rate from whatever samples arrive and **dead-reckons
+   across blackouts**, stopping to re-anchor. It deliberately stops `--overlap`
+   seconds short so coasting
    overshoot leaves *more* pre-roll (the safe direction); precision is not a
    goal — overlap for the merge step is. `--until` stops on the live **stream**
    timecode (valid during normal play), with `--duration`/EOT as backstops. When
    `--seek` is used, positive EOT timeouts below 15000 ms are raised to 15000 ms
    because the HC9 can take more than 5 seconds to resume HDV output after
    reverse positioning.
-   These were written without on-hardware testing in the dev sandbox; the rate
-   default and timeouts are tunable and want validation on the HC9.
 8. **`wind start` / `wind end` reach the blank head/tail** that `cue`/`--seek`
    can't (no timecode there). Same WIND opcode `0xC4` (rewind `0x65` / fast-fwd
    `0x75`); completion is detected by polling the AV/C TRANSPORT STATE status
@@ -128,7 +130,17 @@ them away:
    winding is confirmed (pre-ramp). Decks that don't answer `0xD0` fall back to
    `--timeout` (default 900 s) or Ctrl-C. Needed for the full-reel flow: rewind
    before a from-top capture, and the blank leader trips EOT so that capture
-   wants `--eot-timeout 0`. **Unvalidated on hardware** — wants HC9 testing.
+   wants `--eot-timeout 0`. `wind start` returns to the physical start, which is
+   usually blank/no-timecode; it does **not** guarantee the deck is over recorded
+   footage where `cue`/`--seek` can lock.
+9. **`jog forward|back <sec>` is the short relative fast-wind primitive.** It
+   uses the same WIND opcode (`0xC4`) for a fixed wall-clock duration and then
+   STOPs, without pretending to know tape-time distance in a no-timecode region.
+   Use it to step out of blank head/tail until the final `Position:` (or
+   `--json`) reports a readable timecode: `jog forward` from blank head, `jog
+   back` from blank tail. `cue`, `jog`, and `wind` all report a final position;
+   `--json` prints a one-line machine-readable object on stdout. Prefer that
+   over an extra `tapecap info` call when orchestrating.
 
 ### dvmeta specifics
 

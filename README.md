@@ -34,6 +34,8 @@ See [`docs/BACKGROUND.md`](docs/BACKGROUND.md) for the gory details.
 
 - **`list` / `info` / `capture`** — enumerate FireWire AV/C devices, inspect a
   deck's capabilities and current mode/timecode, and capture the raw stream.
+- **Positioning helpers** — `cue` / `jog` / `wind` drive the deck without
+  capturing, report the final position, and support `--json` for scripts.
 - **DV / HDV auto-detect** — picks the format from the deck's output-plug signal
   format; override with `--format dv|hdv`.
 - **Automatic transport control** — sends AV/C **PLAY** on start and **STOP** at
@@ -110,10 +112,11 @@ untouched DV/HDV bitstream, and losslessly post-process the result.
 
 ```
 tapecap list                       # list connected FireWire AV/C devices
-tapecap info    [--guid <hex>]     # show device capabilities, mode, timecode
+tapecap info    [--guid <hex>] [--json]  # show device capabilities, mode, timecode
 tapecap capture [options] [output] # capture raw stream (omit output to auto-name)
-tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a timecode
-tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>  # rewind to start / wind to end
+tapecap cue     [--guid <hex>] [--overlap <sec>] [--json] <timecode>  # fast-wind to a timecode
+tapecap jog     [--guid <hex>] [--json] <forward|back> <sec>          # short timed fast-wind
+tapecap wind    [--guid <hex>] [--timeout <sec>] [--json] <start|end> # rewind to start / wind to end
 ```
 
 ### Capture options
@@ -130,6 +133,25 @@ tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>  # rewind to start 
 | `--no-control` | Don't send AV/C PLAY/STOP — you press play on the deck yourself |
 | `-v`, `--verbose` | Also print the framework's internal log on stderr |
 | `[output]` | File to write. **Omit** to auto-name from the recording's date/time; use `-` for stdout. |
+
+### Positioning output
+
+`info --json` prints a single JSON object on stdout, including
+`timecode_readable` and `timecode`. `cue`, `jog`, and `wind` always print a final
+human-readable position on stderr:
+
+```text
+Position: 00:12:34
+Position: --:--:-- (blank/no timecode)
+```
+
+With `--json`, positioning commands also print one machine-readable line on
+stdout:
+
+```json
+{"ok":true,"timecode_readable":true,"timecode":"00:12:34"}
+{"ok":true,"timecode_readable":false,"timecode":null,"reason":"blank/no-timecode"}
+```
 
 While capturing, a **live status line** (tape SMPTE timecode, recording
 date/time, size, coded-frame count and a continuity-error count) updates in
@@ -161,6 +183,9 @@ tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
 # Position only — fast-wind the tape to 30:00 and stop, without capturing:
 tapecap cue 00:30:00
 
+# Short fast-wind probe, useful when parked in blank/no-timecode tape:
+tapecap jog forward 3
+
 # Rewind to the very beginning, or fast-wind to the very end (blank, no timecode):
 tapecap wind start
 tapecap wind end
@@ -177,14 +202,21 @@ captured stream's timecode passes a point.
 
 A `<timecode>` is `HH:MM:SS` (also `HH:MM:SS:FF` with frames ignored, `MM:SS`, or
 a bare number of seconds). These drive the transport, so they need AV/C control
-(not `--no-control`). Tape positioning is **coarse** — decks coast past a stop,
-and (the very reason you're re-capturing) aged tapes drop their timecode
-mid-travel — so the landing point is approximate. `--overlap <sec>` (default 4)
-deliberately keeps extra footage on each side so the re-capture **overlaps** the
-neighbouring good material, which is exactly what a frame-merge step wants. The
-seek reads the deck's AV/C timecode opportunistically and dead-reckons across
-timecode dropouts. `tapecap cue <tc>` exposes the positioning on its own, for an
-orchestrator that prefers to cue the deck and then run `capture --no-control`.
+(not `--no-control`). `cue` / `--seek` need a readable **current** tape timecode
+as an anchor, not just a target timecode; they work from recorded footage, not
+from the blank head/tail. If the deck is parked in a no-timecode region, use
+`jog forward <sec>` / `jog back <sec>` and watch the final `Position:` (or
+`--json`) until a timecode is readable, then cue/seek. `capture --seek` aborts
+without capturing if it cannot establish that initial anchor.
+
+Tape positioning is **coarse** — decks coast past a stop, and (the very reason
+you're re-capturing) aged tapes drop their timecode mid-travel — so the landing
+point is approximate. `--overlap <sec>` (default 4) deliberately keeps extra
+footage on each side so the re-capture **overlaps** the neighbouring good
+material, which is exactly what a frame-merge step wants. The seek reads the
+deck's AV/C timecode opportunistically and dead-reckons across timecode dropouts.
+`tapecap cue <tc>` exposes the positioning on its own, for an orchestrator that
+prefers to cue the deck and then run `capture --no-control`.
 
 By default `tapecap` issues an AV/C **PLAY** when capture starts and **STOP**
 when it ends, so you can leave the deck alone. Use `--no-control` if you prefer
@@ -193,18 +225,22 @@ to drive playback yourself (or the deck ignores AV/C transport commands).
 ### Winding to the ends (`wind start` / `wind end`)
 
 `cue`/`--seek` target a **timecode**, so they only reach recorded footage. The
-blank **head and tail** of a tape have no timecode, so use `wind` for those:
-`tapecap wind start` rewinds to the very beginning, `tapecap wind end` fast-winds
-to the very end. It drives the transport and watches the deck's transport state,
-stopping when the deck auto-stops at the mechanical end; if a deck doesn't report
-that state, stop it with Ctrl-C or bound it with `--timeout <sec>` (default 900).
+blank **head and tail** of a tape have no timecode, so use `wind` for physical
+ends: `tapecap wind start` rewinds to the very beginning, `tapecap wind end`
+fast-winds to the very end. It drives the transport and watches the deck's
+transport state, stopping when the deck auto-stops at the mechanical end; if a
+deck doesn't report that state, stop it with Ctrl-C or bound it with
+`--timeout <sec>` (default 900).
 
 When **archiving a whole tape**: `tapecap wind start` first, then capture. Two
 gotchas — the blank leader at the very start looks like end-of-tape and trips the
 silence timeout, so pass **`--eot-timeout 0`** for a from-the-top capture; and
-after a full pass the deck is parked in the blank tail (no timecode), so run
-`tapecap wind start` before any further `cue`/`--seek`, and again at the end to
-leave the tape rewound.
+after a full pass the deck is parked in the blank tail (no timecode), so
+`cue`/`--seek` cannot lock on there. If you need another targeted capture, use
+short `tapecap jog back 3` probes until `Position:` reports a readable timecode,
+then cue/seek from that anchor. If you need a full rewind first, run
+`tapecap wind start`, then use short `tapecap jog forward 3` probes before
+cue/seek. Run `tapecap wind start` again at the end to leave the tape rewound.
 
 ## Permissions
 

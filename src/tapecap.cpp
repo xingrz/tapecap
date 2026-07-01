@@ -37,7 +37,7 @@ using namespace AVS;
 // ---------------------------------------------------------------------------
 // Version
 // ---------------------------------------------------------------------------
-static const char *kTapecapVersion = "0.3.1";
+static const char *kTapecapVersion = "0.4.0";
 
 // ---------------------------------------------------------------------------
 // AV/C tape-transport command operands (subunit-level CONTROL commands).
@@ -438,6 +438,66 @@ static const char *FormatHMS(long sec, char *buf, size_t n)
     return buf;
 }
 
+static std::string JsonEscape(const char *s)
+{
+    std::string out;
+    if (!s) return out;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+    {
+        switch (*p)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (*p < 0x20)
+                {
+                    char b[8];
+                    snprintf(b, sizeof b, "\\u%04x", *p);
+                    out += b;
+                }
+                else
+                {
+                    out += (char)*p;
+                }
+        }
+    }
+    return out;
+}
+
+static const char *JsonBool(bool v) { return v ? "true" : "false"; }
+
+static void PrintPosition(AVCDevice *dev, bool json, bool ok)
+{
+    long sec = 0;
+    bool have = ReadTapeTcSeconds(dev, &sec);
+    char tc[16];
+    if (have)
+    {
+        FormatHMS(sec, tc, sizeof tc);
+        Info("Position: %s", tc);
+    }
+    else
+    {
+        Info("Position: --:--:-- (blank/no timecode)");
+    }
+
+    if (json)
+    {
+        if (have)
+            printf("{\"ok\":%s,\"timecode_readable\":true,\"timecode\":\"%s\"}\n",
+                   JsonBool(ok), tc);
+        else
+            printf("{\"ok\":%s,\"timecode_readable\":false,\"timecode\":null,\"reason\":\"blank/no-timecode\"}\n",
+                   JsonBool(ok));
+        fflush(stdout);
+    }
+}
+
 static double NowMono()
 {
     struct timespec ts;
@@ -510,7 +570,8 @@ static bool FineSeekToTimecode(AVCDevice *dev, long goal, long cur)
 // estimates the wind rate from whatever samples arrive, and dead-reckons across
 // blackouts, periodically stopping to re-anchor. Coasting overshoot lands the
 // tape a little further from the target (i.e. more pre-roll), which is the safe
-// direction. Returns true if it confirmed a position at/inside the goal.
+// direction. Returns true if it made a best-effort positioning decision, false
+// if it cannot establish an initial timecode anchor or transport control fails.
 static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
 {
     long goal = targetSec - overlapSec;
@@ -532,7 +593,7 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
     }
     if (!have)
     {
-        Info("seek: cannot read tape timecode; capturing from the current position.");
+        Info("seek: cannot read tape timecode; cannot seek from the current position.");
         return false;
     }
 
@@ -649,6 +710,57 @@ static bool SeekToTimecode(AVCDevice *dev, long targetSec, long overlapSec)
     return reached;
 }
 
+// Fast-wind for a fixed wall-clock duration, then stop. This is deliberately not
+// timecode-based; it is for probing blank/no-timecode regions until recorded
+// footage becomes readable again.
+static bool JogTape(AVCDevice *dev, bool forward, long durationSec)
+{
+    const UInt8 windOp = forward ? kTapeWindFastFwd : kTapeWindRewind;
+    const char *label  = forward ? "FAST FORWARD" : "REWIND";
+
+    if (!SendTransportOrWarn(dev, kAVCTapeWindOpcode, windOp, label))
+        return false;
+
+    const double started = NowMono();
+    double lastReport    = started;
+    bool   sawWinding    = false;
+
+    while (!gStopRequested.load())
+    {
+        usleep(250 * 1000);
+        const double now = NowMono();
+        if (now - started >= (double)durationSec)
+            break;
+
+        UInt8 mode = 0, state = 0; bool stable = false;
+        if (ReadTransportState(dev, &mode, &state, &stable))
+        {
+            const bool winding = (mode == kAVCTapeTportModeWind) && (state != kTapeWindStop);
+            if (winding) sawWinding = true;
+            if (stable && !winding && (sawWinding || now - started > 4.0))
+            {
+                Info("jog: deck stopped before the requested duration (end of tape?).");
+                break;
+            }
+        }
+
+        if (now - lastReport >= 3.0)
+        {
+            lastReport = now;
+            long tc; char b[16];
+            if (ReadTapeTcSeconds(dev, &tc))
+                Info("jog: %s... at %s (%.0fs)", label, FormatHMS(tc, b, sizeof b), now - started);
+            else
+                Info("jog: %s... (%.0fs, blank/no timecode)", label, now - started);
+        }
+    }
+
+    SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+    usleep(300 * 1000);
+    if (gStopRequested.load()) { Info("jog: interrupted."); return false; }
+    return true;
+}
+
 // Fast-wind the tape to a physical extreme — the very end (forward) or the very
 // start (rewind) — and stop when the deck gets there. The head and tail of a
 // tape are blank with no timecode, so cue/seek can't target them; this just
@@ -715,6 +827,16 @@ static bool WindToTapeEnd(AVCDevice *dev, bool forward, long timeoutSec)
 }
 
 enum DetectedFormat { kFmtUnknown, kFmtDV, kFmtHDV };
+
+static const char *DetectedFormatName(DetectedFormat f)
+{
+    switch (f)
+    {
+        case kFmtHDV: return "HDV / MPEG-TS";
+        case kFmtDV:  return "DV";
+        default:      return "not reported";
+    }
+}
 
 // Read the *actual* stream format from the device's output plug (oPCR). This
 // reflects what the deck is really putting on the bus, which is more reliable
@@ -803,7 +925,7 @@ static int CmdList()
     return count > 0 ? 0 : 2;
 }
 
-static int CmdInfo(UInt64 guid)
+static int CmdInfo(UInt64 guid, bool json)
 {
     AVCDeviceController *controller = nullptr;
     StringLogger logger(FrameworkLog);
@@ -826,40 +948,103 @@ static int CmdInfo(UInt64 guid)
     // *current* DV/HDV playback mode.
     dev->discoverAVCDeviceCapabilities();
 
-    printf("Device:        %s\n", dev->deviceName[0] ? dev->deviceName : "Unknown");
-    printf("GUID:          0x%016llX\n", dev->guid);
-    printf("Vendor:        %s\n", dev->vendorName[0] ? dev->vendorName : "?");
-    printf("Format:        %s\n", FormatName(dev));
-    if (dev->isMPEGDevice) printf("MPEG mode:     0x%02X\n", dev->mpegMode);
-    if (dev->isDVDevice)   printf("DV mode:       0x%02X\n", dev->dvMode);
-    printf("Tape subunit:  %s\n", dev->hasTapeSubunit ? "yes" : "no");
-    printf("Supports FCP:  %s\n", dev->supportsFCP ? "yes" : "no");
-    printf("Output plugs:  %u\n", (unsigned)dev->numOutputPlugs);
+    if (!json)
+    {
+        printf("Device:        %s\n", dev->deviceName[0] ? dev->deviceName : "Unknown");
+        printf("GUID:          0x%016llX\n", dev->guid);
+        printf("Vendor:        %s\n", dev->vendorName[0] ? dev->vendorName : "?");
+        printf("Format:        %s\n", FormatName(dev));
+        if (dev->isMPEGDevice) printf("MPEG mode:     0x%02X\n", dev->mpegMode);
+        if (dev->isDVDevice)   printf("DV mode:       0x%02X\n", dev->dvMode);
+        printf("Tape subunit:  %s\n", dev->hasTapeSubunit ? "yes" : "no");
+        printf("Supports FCP:  %s\n", dev->supportsFCP ? "yes" : "no");
+        printf("Output plugs:  %u\n", (unsigned)dev->numOutputPlugs);
+    }
 
+    bool openOk = false;
+    DetectedFormat op = kFmtUnknown;
+    UInt8 opDvMode = 0xFF;
+    UInt32 rawSignalFormat = 0;
+    bool haveTc = false;
+    long tcSec = 0;
     IOReturn openResult = dev->openDevice(DeviceMessageProc, nullptr);
     if (openResult == kIOReturnSuccess)
     {
+        openOk = true;
         // The output-plug (oPCR) format reflects what's actually on the bus and
         // is the value capture's auto-detect trusts. It can disagree with the
         // signal-mode "Format" above (e.g. Sony HDR-HC9 reports DV there while
         // streaming HDV) — so show it explicitly.
-        UInt8 opDvMode = 0xFF;
-        UInt32 rawSignalFormat = 0;
-        DetectedFormat op = ReadOutputPlugFormat(dev, 0, &opDvMode, &rawSignalFormat);
-        if (op == kFmtDV && opDvMode != 0xFF)
-            printf("Output plug 0: DV (mode 0x%02X, raw 0x%08X)\n", opDvMode, rawSignalFormat);
-        else
-            printf("Output plug 0: %s\n",
-                   op == kFmtHDV ? "HDV / MPEG-TS" : "not reported (idle?)");
+        op = ReadOutputPlugFormat(dev, 0, &opDvMode, &rawSignalFormat);
+        if (!json)
+        {
+            if (op == kFmtDV && opDvMode != 0xFF)
+                printf("Output plug 0: DV (mode 0x%02X, raw 0x%08X)\n", opDvMode, rawSignalFormat);
+            else
+                printf("Output plug 0: %s\n",
+                       op == kFmtUnknown ? "not reported (idle?)" : DetectedFormatName(op));
+        }
 
         char tc[32];
-        if (ReadTimecode(dev, tc, sizeof(tc)))
+        if (!json && ReadTimecode(dev, tc, sizeof(tc)))
             printf("Timecode:      %s\n", tc);
+        haveTc = ReadTapeTcSeconds(dev, &tcSec);
+        if (!json && !haveTc)
+            printf("Timecode:      --:--:-- (blank/no timecode)\n");
         dev->closeDevice();
     }
     else
     {
-        printf("Open:          failed (0x%08X)\n", openResult);
+        if (!json)
+            printf("Open:          failed (0x%08X)\n", openResult);
+    }
+
+    if (json)
+    {
+        char guidBuf[32];
+        snprintf(guidBuf, sizeof guidBuf, "0x%016llX", dev->guid);
+        printf("{");
+        printf("\"device\":\"%s\"", JsonEscape(dev->deviceName[0] ? dev->deviceName : "Unknown").c_str());
+        printf(",\"guid\":\"%s\"", guidBuf);
+        printf(",\"vendor\":\"%s\"", JsonEscape(dev->vendorName[0] ? dev->vendorName : "?").c_str());
+        printf(",\"format\":\"%s\"", JsonEscape(FormatName(dev)).c_str());
+        printf(",\"mpeg_mode\":");
+        if (dev->isMPEGDevice) printf("%u", (unsigned)dev->mpegMode); else printf("null");
+        printf(",\"dv_mode\":");
+        if (dev->isDVDevice) printf("%u", (unsigned)dev->dvMode); else printf("null");
+        printf(",\"tape_subunit\":%s", JsonBool(dev->hasTapeSubunit));
+        printf(",\"supports_fcp\":%s", JsonBool(dev->supportsFCP));
+        printf(",\"output_plugs\":%u", (unsigned)dev->numOutputPlugs);
+        printf(",\"open\":%s", JsonBool(openOk));
+        if (!openOk)
+            printf(",\"open_error\":\"0x%08X\"", openResult);
+        printf(",\"output_plug_0\":");
+        if (openOk && op != kFmtUnknown)
+            printf("\"%s\"", JsonEscape(DetectedFormatName(op)).c_str());
+        else
+            printf("null");
+        printf(",\"output_plug_0_dv_mode\":");
+        if (openOk && op == kFmtDV && opDvMode != 0xFF)
+            printf("%u", (unsigned)opDvMode);
+        else
+            printf("null");
+        printf(",\"output_plug_0_raw_format\":");
+        if (openOk && rawSignalFormat != 0)
+            printf("\"0x%08X\"", rawSignalFormat);
+        else
+            printf("null");
+        printf(",\"timecode_readable\":%s", JsonBool(haveTc));
+        printf(",\"timecode\":");
+        if (haveTc)
+        {
+            char pos[16];
+            printf("\"%s\"", FormatHMS(tcSec, pos, sizeof pos));
+        }
+        else
+        {
+            printf("null,\"reason\":\"%s\"", openOk ? "blank/no-timecode" : "open-failed");
+        }
+        printf("}\n");
     }
 
     DestroyAVCDeviceController(controller);
@@ -1146,7 +1331,17 @@ static int CmdCapture(const CaptureOptions &opt)
     {
         if (!dev->hasTapeSubunit)
             Info("warning: device did not report a tape subunit; attempting AV/C transport anyway.");
-        SeekToTimecode(dev, opt.seekSec, opt.overlapSec);
+        if (!SeekToTimecode(dev, opt.seekSec, opt.overlapSec))
+        {
+            if (opt.control)
+                SendTransportOrWarn(dev, kAVCTapeWindOpcode, kTapeWindStop, "STOP");
+            PrintPosition(dev, false, false);
+            Info("error: seek failed; capture was not started.");
+            dev->closeDevice();
+            DestroyAVCDeviceController(controller);
+            cleanupOut();
+            return 2;
+        }
         playStarted = false;
     }
 
@@ -1359,6 +1554,7 @@ struct CueOptions
     UInt64 guid       = 0;
     long   targetSec  = 0;
     long   overlapSec = 0;   // default: land on the target (no pre-roll)
+    bool   json       = false;
     bool   haveTarget = false;
 };
 
@@ -1401,6 +1597,7 @@ static int CmdCue(const CueOptions &opt)
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
     Info("Cueing to %s…", FormatHMS(opt.targetSec, b, sizeof b));
     bool ok = SeekToTimecode(dev, opt.targetSec, opt.overlapSec);
+    PrintPosition(dev, opt.json, ok);
 
     dev->closeDevice();
     DestroyAVCDeviceController(controller);
@@ -1413,6 +1610,7 @@ struct WindOptions
     bool   toEnd      = false;   // true = fast-forward to end, false = rewind to start
     bool   haveDir    = false;
     long   timeoutSec = 900;     // safety backstop if the deck never reports a stop
+    bool   json       = false;
 };
 
 // Position-only: fast-wind to the physical end or start of the tape. The blank
@@ -1454,6 +1652,62 @@ static int CmdWind(const WindOptions &opt)
     Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
     Info("Winding to the %s of the tape… (Ctrl-C to stop)", opt.toEnd ? "end" : "start");
     bool ok = WindToTapeEnd(dev, opt.toEnd, opt.timeoutSec);
+    PrintPosition(dev, opt.json, ok);
+
+    dev->closeDevice();
+    DestroyAVCDeviceController(controller);
+    return ok ? 0 : 2;
+}
+
+struct JogOptions
+{
+    UInt64 guid        = 0;
+    bool   forward     = true;
+    bool   haveDir     = false;
+    long   durationSec = 0;
+    bool   json        = false;
+};
+
+// Position-only: fast-wind for a short relative wall-clock duration and stop.
+// Useful for stepping out of blank head/tail regions where cue/seek have no
+// timecode anchor. The duration is wall time, not tape time.
+static int CmdJog(const JogOptions &opt)
+{
+    StringLogger logger(FrameworkLog);
+    AVCDeviceController *controller = nullptr;
+    if (CreateAVCDeviceController(&controller, nullptr, nullptr) != kIOReturnSuccess || !controller)
+    {
+        Info("error: could not create AVC device controller (is the FireWire driver present?)");
+        return 1;
+    }
+    WaitForDevices(controller, 3000);
+
+    AVCDevice *dev = SelectDevice(controller, opt.guid);
+    if (!dev)
+    {
+        Info("error: no DV/HDV device found. Try 'tapecap list'.");
+        DestroyAVCDeviceController(controller);
+        return 2;
+    }
+    dev->discoverAVCDeviceCapabilities();
+
+    if (dev->openDevice(DeviceMessageProc, nullptr) != kIOReturnSuccess)
+    {
+        Info("error: could not open device '%s'. Another app may be using it,", dev->deviceName);
+        Info("       or capture permission was denied (see README: permissions).");
+        DestroyAVCDeviceController(controller);
+        return 1;
+    }
+    if (!dev->hasTapeSubunit)
+        Info("warning: device did not report a tape subunit; attempting AV/C transport anyway.");
+
+    signal(SIGINT, HandleSignal);
+    signal(SIGTERM, HandleSignal);
+
+    Info("Device:  %s (0x%016llX)", dev->deviceName[0] ? dev->deviceName : "Unknown", dev->guid);
+    Info("Jogging %s for %lds… (Ctrl-C to stop)", opt.forward ? "forward" : "back", opt.durationSec);
+    bool ok = JogTape(dev, opt.forward, opt.durationSec);
+    PrintPosition(dev, opt.json, ok);
 
     dev->closeDevice();
     DestroyAVCDeviceController(controller);
@@ -1470,10 +1724,11 @@ static void Usage(FILE *f)
 "\n"
 "USAGE:\n"
 "  tapecap list\n"
-"  tapecap info    [--guid <hex>]\n"
+"  tapecap info    [--guid <hex>] [--json]\n"
 "  tapecap capture [options] [output]\n"
-"  tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>\n"
-"  tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>\n"
+"  tapecap cue     [--guid <hex>] [--overlap <sec>] [--json] <timecode>\n"
+"  tapecap jog     [--guid <hex>] [--json] <forward|back> <sec>\n"
+"  tapecap wind    [--guid <hex>] [--timeout <sec>] [--json] <start|end>\n"
 "  tapecap --help | --version\n"
 "\n"
 "CAPTURE OPTIONS:\n"
@@ -1496,11 +1751,17 @@ static void Usage(FILE *f)
 "position is approximate; --overlap deliberately keeps extra footage on each\n"
 "side so re-capture windows overlap (use it for tapeflow gap re-capture).\n"
 "\n"
+"cue, jog and wind print a final Position line. With --json they also print a\n"
+"single machine-readable JSON object to stdout. 'jog forward 3' or 'jog back 3'\n"
+"fast-winds for a short wall-clock duration, useful for stepping out of blank\n"
+"no-timecode leader/tail before trying cue/seek again.\n"
+"\n"
 "'wind start' rewinds to the very beginning and 'wind end' fast-winds to the\n"
 "very end. The blank head/tail has no timecode, so cue can't reach it — use\n"
-"'wind' there instead. After a full-reel capture the deck sits in the blank\n"
-"tail; 'wind start' brings it back to where cue/seek work again, and leaves the\n"
-"tape rewound when you're done.\n"
+"'wind' for physical ends and 'jog' to step back into recorded footage. Jog\n"
+"forward from blank head or back from blank tail until Position reports a\n"
+"timecode before trying cue/seek. Finish with 'wind start' to leave the tape\n"
+"rewound when you're done.\n"
 "\n"
 "While capturing, a live status line (tape timecode, recording date/time, size,\n"
 "frame count, and a transport continuity-error count) is shown in place on\n"
@@ -1516,6 +1777,7 @@ static void Usage(FILE *f)
 "  tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv\n"
 "  tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t   # re-capture one gap\n"
 "  tapecap cue 00:30:00                       # just wind the tape to 30:00\n"
+"  tapecap jog forward 3                      # short fast-forward probe\n"
 "  tapecap wind start                         # rewind to the very beginning\n"
 "  tapecap wind end                           # fast-wind to the very end\n",
     kTapecapVersion);
@@ -1558,14 +1820,16 @@ int main(int argc, char **argv)
     if (cmd == "info")
     {
         UInt64 guid = 0;
+        bool json = false;
         for (int i = 2; i < argc; i++)
         {
             std::string a = argv[i];
             if (a == "--guid")        guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
+            else if (a == "--json")   json = true;
             else if (a == "-v" || a == "--verbose") gVerboseLog = true;
             else { Info("error: unknown option for 'info': %s", a.c_str()); return 2; }
         }
-        return CmdInfo(guid);
+        return CmdInfo(guid, json);
     }
 
     if (cmd == "capture")
@@ -1639,6 +1903,7 @@ int main(int argc, char **argv)
             std::string a = argv[i];
             if (a == "--guid")         opt.guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
             else if (a == "--overlap") { opt.overlapSec = atol(NextArg(argc, argv, i, "--overlap")); if (opt.overlapSec < 0) opt.overlapSec = 0; }
+            else if (a == "--json")    opt.json = true;
             else if (a == "-v" || a == "--verbose") gVerboseLog = true;
             else if (!a.empty() && a[0] == '-')
             { Info("error: unknown option for 'cue': %s", a.c_str()); return 2; }
@@ -1654,6 +1919,46 @@ int main(int argc, char **argv)
         return CmdCue(opt);
     }
 
+    if (cmd == "jog")
+    {
+        JogOptions opt;
+        bool haveDuration = false;
+        for (int i = 2; i < argc; i++)
+        {
+            std::string a = argv[i];
+            if (a == "--guid")        opt.guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
+            else if (a == "--json")   opt.json = true;
+            else if (a == "-v" || a == "--verbose") gVerboseLog = true;
+            else if (a == "forward" || a == "fwd" || a == "ff")
+            {
+                if (opt.haveDir) { Info("error: 'jog' takes one direction"); return 2; }
+                opt.forward = true;
+                opt.haveDir = true;
+            }
+            else if (a == "back" || a == "backward" || a == "reverse" || a == "rewind" || a == "rew")
+            {
+                if (opt.haveDir) { Info("error: 'jog' takes one direction"); return 2; }
+                opt.forward = false;
+                opt.haveDir = true;
+            }
+            else if (!a.empty() && a[0] == '-')
+            { Info("error: unknown option for 'jog': %s", a.c_str()); return 2; }
+            else
+            {
+                if (haveDuration) { Info("error: 'jog' takes one duration in seconds"); return 2; }
+                char *end = nullptr;
+                long v = strtol(a.c_str(), &end, 10);
+                if (!end || *end != '\0' || v <= 0)
+                { Info("error: bad jog duration '%s' (use positive seconds)", a.c_str()); return 2; }
+                opt.durationSec = v;
+                haveDuration = true;
+            }
+        }
+        if (!opt.haveDir) { Info("error: 'jog' needs a direction: 'forward' or 'back'"); return 2; }
+        if (!haveDuration) { Info("error: 'jog' needs a duration in seconds"); return 2; }
+        return CmdJog(opt);
+    }
+
     if (cmd == "wind")
     {
         WindOptions opt;
@@ -1662,6 +1967,7 @@ int main(int argc, char **argv)
             std::string a = argv[i];
             if (a == "--guid")          opt.guid = ParseGuid(NextArg(argc, argv, i, "--guid"));
             else if (a == "--timeout")  { opt.timeoutSec = atol(NextArg(argc, argv, i, "--timeout")); if (opt.timeoutSec <= 0) opt.timeoutSec = 900; }
+            else if (a == "--json")     opt.json = true;
             else if (a == "-v" || a == "--verbose") gVerboseLog = true;
             else if (a == "start" || a == "rewind" || a == "begin") { opt.toEnd = false; opt.haveDir = true; }
             else if (a == "end" || a == "ff")                       { opt.toEnd = true;  opt.haveDir = true; }

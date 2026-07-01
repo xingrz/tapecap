@@ -1,6 +1,6 @@
 ---
 name: tapecap
-description: Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) — especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck, capturing the untouched bitstream, and losslessly post-processing the result.
+description: Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) — especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck, cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly post-processing the result.
 ---
 
 # tapecap — raw DV / HDV tape capture over FireWire
@@ -54,10 +54,11 @@ make install    # optional, -> /usr/local/bin
 
 ```
 tapecap list                       # enumerate connected FireWire AV/C devices
-tapecap info    [--guid <hex>]     # show a deck's capabilities, mode, timecode
+tapecap info    [--guid <hex>] [--json]  # show a deck's capabilities, mode, timecode
 tapecap capture [options] [output] # capture the raw stream (omit output to auto-name)
-tapecap cue     [--guid <hex>] [--overlap <sec>] <timecode>  # fast-wind to a timecode
-tapecap wind    [--guid <hex>] [--timeout <sec>] <start|end>  # rewind to start / wind to end
+tapecap cue     [--guid <hex>] [--overlap <sec>] [--json] <timecode>  # fast-wind to a timecode
+tapecap jog     [--guid <hex>] [--json] <forward|back> <sec>          # short timed fast-wind
+tapecap wind    [--guid <hex>] [--timeout <sec>] [--json] <start|end> # rewind to start / wind to end
 ```
 
 ### Recommended workflow
@@ -121,6 +122,9 @@ tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
 # Position only — fast-wind to 30:00 and stop, then capture however you like:
 tapecap cue 00:30:00
 
+# Short fast-wind probe when parked in blank/no-timecode tape:
+tapecap jog forward 3
+
 # Rewind to the very beginning (the blank head, where cue/seek can't reach):
 tapecap wind start
 
@@ -141,6 +145,15 @@ Key things to get right when driving this:
 
 - **A `<timecode>` is `HH:MM:SS`** (also `HH:MM:SS:FF` with frames ignored,
   `MM:SS`, or a bare number of seconds).
+- **`cue` / `--seek` need a readable current timecode anchor**, not just a target
+  timecode. They work from recorded footage. If the deck is parked in the blank
+  head/tail and `Position:` / `info --json` says `timecode_readable: false`, do
+  **not** run `capture --seek` and do **not** fall back to normal capture from
+  the current position. Use short probes like `tapecap jog --json forward 3`
+  (or `jog back`) until a timecode is readable, then cue/seek.
+- **DV supports cue/seek.** The position comes from the deck's AV/C TIME CODE
+  status query, not from HDV-only AUX metadata. If DV cue fails, suspect blank
+  tape, missing AV/C timecode, or transport-control failure — not the DV format.
 - **Seeking is coarse, on purpose.** Decks coast past a stop, and aged tapes (the
   reason for re-capturing) drop their timecode mid-travel, so the landing point is
   approximate. `--overlap <sec>` (default 4) keeps extra footage on both sides so
@@ -150,6 +163,14 @@ Key things to get right when driving this:
   `--no-control`.
 - **`cue <tc>` positions only** (no capture) — for an orchestrator that prefers to
   cue the deck, then run `capture --no-control` itself.
+- **Movement commands return their final position.** `cue`, `jog`, and `wind`
+  print `Position: 00:12:34` or `Position: --:--:-- (blank/no timecode)`. Pass
+  `--json` to also get one stdout line such as
+  `{"ok":true,"timecode_readable":true,"timecode":"00:12:34"}`. Prefer this over
+  a separate `tapecap info` call when orchestrating.
+- **`capture --seek` aborts if the initial seek fails.** Treat that as a hard
+  stop and fix the deck position first; don't start a plain `capture` from the
+  same no-timecode location.
 - The capture output is still the untouched raw stream; keep treating each
   re-captured segment as an archival fragment to hand back to tapeflow.
 
@@ -157,10 +178,13 @@ Key things to get right when driving this:
 
 `cue`/`--seek` target a **timecode**, so they only work where the tape carries
 timecode — i.e. over recorded footage. The **head and tail of a tape are blank
-and have no timecode**, so cue can't reach them. Use `wind` for those:
+and have no timecode**, so cue can't reach them. Use `wind` for physical ends:
 
 - **`tapecap wind start`** rewinds to the very beginning.
 - **`tapecap wind end`** fast-winds to the very end.
+- **`tapecap jog forward 3`** / **`tapecap jog back 3`** fast-winds for a short
+  wall-clock duration and stops. Use this to step out of blank/no-timecode tape
+  until the final `Position:` becomes readable.
 
 `tapecap` drives the AV/C transport and watches the deck's transport state,
 stopping when the deck auto-stops at the mechanical end/start. If a deck doesn't
@@ -182,9 +206,12 @@ When archiving a whole tape from the top, mind these — they trip up agents:
   length. Don't report a 0-byte/instant capture as "end of tape" — suspect this.
 - **After a full capture the deck sits in the blank tail.** It has run past the
   last footage into the blank end, where there's no timecode, so a follow-up
-  `cue`/`--seek` has nothing to lock onto and won't position correctly. **Run
-  `tapecap wind start` first** to bring the tape back over recorded footage (where
-  timecode exists again) before any further cue/seek operations.
+  `cue`/`--seek` has nothing to lock onto and won't position correctly. For
+  another targeted capture, use short `jog back` probes until the final
+  `Position:` reports a readable timecode, then cue/seek from that anchor. If you
+  need a full rewind first, `wind start` returns to the physical start, which is
+  usually another blank/no-timecode region; use short `jog forward` probes before
+  cue/seek.
 - **Finish by rewinding.** Once all captures are done and the user confirms
   there's nothing more to grab, **`tapecap wind start`** to return the tape to its
   original (rewound) state. Leaving the tape fully rewound is part of completing
