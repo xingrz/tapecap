@@ -1,6 +1,6 @@
 ---
 name: tapecap
-description: Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) — especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck, cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly post-processing the result.
+description: Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) — especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck, cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly post-processing the result. Also trigger on Chinese phrasings: 采集磁带/采带、数字化 DV/HDV 磁带、倒带/进带/定位到时间码、补采某一段.
 ---
 
 # tapecap — raw DV / HDV tape capture over FireWire
@@ -60,6 +60,17 @@ tapecap cue     [--guid <hex>] [--overlap <sec>] [--json] <timecode>  # fast-win
 tapecap jog     [--guid <hex>] [--json] <forward|back> <sec>          # short timed fast-wind
 tapecap wind    [--guid <hex>] [--timeout <sec>] [--json] <start|end> # rewind to start / wind to end
 ```
+
+### Exit codes
+
+When orchestrating, branch on the exit code — the human-readable `error: …` line
+is on stderr, but the code is the contract:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success. |
+| `1` | System failure retrying won't cure — FireWire stack/driver unavailable, output file can't be opened, write error mid-capture. |
+| `2` | The request couldn't proceed — bad arguments, no device on the bus, format detection failed, a `cue`/`--seek` that didn't land (capture never started), or a capture that ended with 0 bytes. Fix the arguments, deck or tape position, then retry. |
 
 ### Recommended workflow
 
@@ -162,7 +173,9 @@ Key things to get right when driving this:
 - **`--seek`/`--until`/`cue` need AV/C control**, so they can't be combined with
   `--no-control`.
 - **`cue <tc>` positions only** (no capture) — for an orchestrator that prefers to
-  cue the deck, then run `capture --no-control` itself.
+  cue the deck, then run `capture --no-control` itself. Mind the default: `cue`'s
+  `--overlap` is **0** (land on the target), unlike `capture`'s 4 — pass
+  `--overlap` explicitly when the follow-up capture needs pre-roll.
 - **Movement commands return their final position.** `cue`, `jog`, and `wind`
   print `Position: 00:12:34` or `Position: --:--:-- (blank/no timecode)`. Pass
   `--json` to also get one stdout line such as
