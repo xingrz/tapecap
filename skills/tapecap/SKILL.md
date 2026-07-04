@@ -1,6 +1,13 @@
 ---
 name: tapecap
-description: Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) — especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck, cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly post-processing the result. Also trigger on Chinese phrasings: 采集磁带/采带、数字化 DV/HDV 磁带、倒带/进带/定位到时间码、补采某一段.
+description: >-
+  Capture raw DV / HDV tape over FireWire on macOS with the `tapecap` CLI. Use when the user wants
+  to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) —
+  especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio
+  and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck,
+  cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly
+  post-processing the result. Also trigger on Chinese phrasings:
+  采集磁带/采带、数字化 DV/HDV 磁带、倒带/进带/定位到时间码、补采某一段.
 ---
 
 # tapecap — raw DV / HDV tape capture over FireWire
