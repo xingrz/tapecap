@@ -120,7 +120,8 @@ them away:
    timecode (valid during normal play), with `--duration`/EOT as backstops. When
    `--seek` is used, positive EOT timeouts below 15000 ms are raised to 15000 ms
    because the HC9 can take more than 5 seconds to resume HDV output after
-   reverse positioning.
+   reverse positioning. Never use `--seek`/`--until` as an exact cut at a
+   timecode reset: capture across it and partition the file afterward.
 8. **`wind start` / `wind end` reach the blank head/tail** that `cue`/`--seek`
    can't (no timecode there). Same WIND opcode `0xC4` (rewind `0x65` / fast-fwd
    `0x75`); completion is detected by polling the AV/C TRANSPORT STATE status
@@ -141,6 +142,13 @@ them away:
    back` from blank tail. `cue`, `jog`, and `wind` all report a final position;
    `--json` prints a one-line machine-readable object on stdout. Prefer that
    over an extra `tapecap info` call when orchestrating.
+10. **A forced format intentionally receives only that format.** One `capture`
+    invocation cannot produce both DV and HDV. On a mixed-format tape, start the
+    later-format capture while still in the earlier event and pass
+    `--eot-timeout 0` (or a value longer than the lead-in); otherwise the
+    no-data callback can stop before the requested format appears. `--duration`
+    counts from PLAY, not from the first written byte, so use a generous bound
+    or supervise the stop.
 
 ### dvmeta specifics
 
@@ -265,6 +273,9 @@ hardware), the prior sessions hit these:
 
 ## Conventions
 
+- Hard-wrap every non-blank commit-message line at 75 characters or fewer,
+  including the subject, body, and trailers. Rewrite an overlong subject rather
+  than splitting it.
 - Commit messages end with a co-author trailer naming the AI model, e.g.
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` — and do **not**
   include any session URL. (Use whatever model is running the session.)

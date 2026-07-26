@@ -5,9 +5,12 @@ description: >-
   to archive or digitize DV, DVCAM, Digital8 or HDV camcorder/deck tapes on a Mac (macOS 11–15) —
   especially HDV, where AVFoundation-based tools (ffmpeg, dvrescue, iMovie) silently drop the audio
   and transport-stream metadata. Covers enumerating FireWire AV/C devices, inspecting a deck,
-  cueing/jogging/winding tape position, capturing the untouched bitstream, and losslessly
-  post-processing the result. Also trigger on Chinese phrasings:
-  采集磁带/采带、数字化 DV/HDV 磁带、倒带/进带/定位到时间码、补采某一段.
+  cueing/jogging/winding tape position, exploring an unknown multi-event or mixed-format tape
+  without a wasteful full capture, handling ordinary event overlap and exact HDV-reset splits,
+  capturing the untouched bitstream, and losslessly post-processing the result. Also trigger on
+  Chinese phrasings:
+  采集磁带/采带、数字化 DV/HDV 磁带、倒带/进带/定位到时间码、探索磁带内容/多事件磁带分段、
+  DV/HDV 混合磁带、补采某一段.
 ---
 
 # tapecap — raw DV / HDV tape capture over FireWire
@@ -93,6 +96,52 @@ By default `tapecap` sends an AV/C **PLAY** when capture starts and **STOP** whe
 it ends, so the user can leave the deck alone. It also stops on `--duration`,
 Ctrl-C, or end of tape.
 
+### Decide whether the tape has multiple events
+
+Unless the user identifies multiple events or asks you to discover them, treat
+the physical tape as one event and capture the full reel. Do not invent splits
+from isolated metadata glitches.
+
+If the contents are unknown, take short probes at widely spaced positions into
+a discovery directory, recording date, timecode, and format. Bracket sustained
+date/format changes with progressively closer probes. Never make a full capture
+only to map the contents.
+
+For an **ordinary same-format boundary**, capture each event directly. Use the
+sustained recording-date change as the boundary, start roughly 3 seconds early,
+and let capture continue roughly 3 seconds into the next event (`--overlap 3`
+when it expresses the window). Deck precision is sufficient because this margin
+is intentionally approximate; do not make a large capture merely to split it
+later. Adjacent event files share about 6 seconds.
+
+Fold a brief different-date insert (typically under a minute) into the
+nearer/contextually related event unless the user says otherwise. Never discard
+it.
+
+Use these exceptions:
+
+- **HDV timecode goes backwards or resets:** still capture across the boundary,
+  but write the raw window to staging and give the final `.m2t` fragments no
+  overlap. A deck cannot position to the reset frame, and `--until` cannot
+  express the cut reliably. Follow the tapeflow skill to split at the indexed
+  GOP byte offset. This applies to both a large original and a small
+  re-capture. If damage/missing data hides the boundary, capture one window
+  spanning both events, split it afterward, and send each side to its event
+  directory. Preserve the raw source.
+- **DV timecode drops out, goes to zero, or jumps:** ignore it for partitioning.
+  LP/imperfect DV can oscillate between valid and zero continuously, and DV
+  plays safely through it. Use sustained recording-date changes and the ordinary
+  direct-capture overlap.
+- **DV/HDV format change:** make separate explicitly formatted captures. To
+  protect the start of the later-format event, start `--format dv` or
+  `--format hdv` while the head is still in the earlier event; the receiver
+  ignores the other format and writes immediately when its format appears.
+  Use `--eot-timeout 0` (or longer than the entire lead-in), and remember
+  `--duration` starts at PLAY rather than at the first written byte. Use a
+  generous duration or supervise the stop so a missing target format cannot run
+  indefinitely. Keep the resulting `.dv` and `.m2t` files in different event
+  directories.
+
 ### Capture options
 
 | Option | Meaning |
@@ -119,45 +168,14 @@ HDV, `tapecap` also prints once which elementary streams are present (video,
 audio, timecode AUX) plus the video geometry / frame rate / bit rate — the audio
 and AUX lines are the proof the data AVFoundation drops made it into the `.m2t`.
 
-### Examples
-
-```sh
-# Auto-detect DV vs HDV, roll the tape, stop at end of tape, auto-name the file:
-tapecap capture
-
-# Force DV, capture a fixed 60 seconds to a named file:
-tapecap capture --format dv --duration 60 clip.dv
-
-# Drive the deck yourself and pipe a live HDV stream straight into ffmpeg:
-tapecap capture --no-control - | ffmpeg -i - -c copy out.mkv
-
-# Pick a specific deck by GUID:
-tapecap capture --guid 0x0800460102345678
-
-# Re-capture just one damaged section by tape timecode (e.g. a tapeflow gap):
-tapecap capture --seek 00:12:30 --until 00:14:00 gap.m2t
-
-# Position only — fast-wind to 30:00 and stop, then capture however you like:
-tapecap cue 00:30:00
-
-# Short fast-wind probe when parked in blank/no-timecode tape:
-tapecap jog forward 3
-
-# Rewind to the very beginning (the blank head, where cue/seek can't reach):
-tapecap wind start
-
-# Fast-wind to the very end of the tape:
-tapecap wind end
-```
-
 ## Targeted re-capture / orchestration (e.g. with tapeflow)
 
 [tapeflow](https://github.com/xingrz/tapeflow) merges several capture passes of a
 worn tape and reports the **remaining gaps, each labelled with a timecode**. To
-re-capture one gap without replaying the whole tape, use `--seek <tc>` (fast-wind
-to the start) and `--until <tc>` (stop after the end) — `tapecap` drives the deck
-with AV/C fast-forward/rewind. Use this when the user wants to automate or
-speed up filling tapeflow's gaps.
+re-capture an ordinary gap inside one event, use `--seek <tc>` (fast-wind to the
+start) and `--until <tc>` (stop after the end) — `tapecap` drives the deck with
+AV/C fast-forward/rewind. Use this when the user wants to automate or speed up
+filling tapeflow's gaps.
 
 Key things to get right when driving this:
 
@@ -177,6 +195,9 @@ Key things to get right when driving this:
   approximate. `--overlap <sec>` (default 4) keeps extra footage on both sides so
   each re-capture **overlaps** the neighbouring good material — exactly what the
   merge step needs. Don't try to make it frame-accurate; lean on overlap instead.
+- **A target at an HDV reset boundary is not an ordinary seek window.** Capture
+  it wide into staging, then split it as described above before adding derived
+  fragments to the affected tapeflow directories.
 - **`--seek`/`--until`/`cue` need AV/C control**, so they can't be combined with
   `--no-control`.
 - **`cue <tc>` positions only** (no capture) — for an orchestrator that prefers to
@@ -197,19 +218,11 @@ Key things to get right when driving this:
 ## Winding to the blank head/tail (`wind`)
 
 `cue`/`--seek` target a **timecode**, so they only work where the tape carries
-timecode — i.e. over recorded footage. The **head and tail of a tape are blank
-and have no timecode**, so cue can't reach them. Use `wind` for physical ends:
-
-- **`tapecap wind start`** rewinds to the very beginning.
-- **`tapecap wind end`** fast-winds to the very end.
-- **`tapecap jog forward 3`** / **`tapecap jog back 3`** fast-winds for a short
-  wall-clock duration and stops. Use this to step out of blank/no-timecode tape
-  until the final `Position:` becomes readable.
-
-`tapecap` drives the AV/C transport and watches the deck's transport state,
-stopping when the deck auto-stops at the mechanical end/start. If a deck doesn't
-report its transport state, fall back to Ctrl-C or `--timeout <sec>` (default
-900). This is position-only; it never captures.
+timecode. Use `wind start|end` for the blank physical ends, and short
+`jog forward|back <sec>` moves to step from blank tape until the final
+`Position:` is readable. These commands only position; they never capture.
+Decks that cannot report transport state require Ctrl-C or `--timeout <sec>`
+(default 900).
 
 ## Full-reel capture, and leaving the tape as you found it
 
@@ -232,6 +245,12 @@ When archiving a whole tape from the top, mind these — they trip up agents:
   need a full rewind first, `wind start` returns to the physical start, which is
   usually another blank/no-timecode region; use short `jog forward` probes before
   cue/seek.
+- **After the first pass, inspect tapeflow's report before any retry.** Live
+  continuity/drop telemetry is not a repair plan. Do not automatically capture
+  the whole reel a second time because the first pass showed many errors; add
+  the file to its tapeflow working directory, run `tapeflow analyze`, and let
+  the reported spans decide what to re-capture. Make another full pass only
+  after that report shows it is justified (or the user explicitly requests it).
 - **Finish by rewinding.** Once all captures are done and the user confirms
   there's nothing more to grab, **`tapecap wind start`** to return the tape to its
   original (rewound) state. Leaving the tape fully rewound is part of completing
